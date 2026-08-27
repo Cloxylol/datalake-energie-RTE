@@ -136,10 +136,14 @@ services:
     restart: unless-stopped
 
   # -- Spark ---------------------------------------------------------------
-  # bitnamilegacy/ : meme purge Docker Hub que pour Kafka ci-dessus. SPARK_MODE
-  # est une variable propre a cette lignee d'image, elle la suit.
+  # Image construite : l'image Bitnami nue n'a pas PyYAML, et common/config.py
+  # l'importe — aucun job Silver ni Gold ne demarre sans. Cf. docker/Dockerfile.spark,
+  # qui porte aussi la bascule bitnami/ -> bitnamilegacy/.
   spark-master:
-    image: bitnamilegacy/spark:3.5.1
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.spark
+    image: datalake-energie/spark:3.5.1
     hostname: spark-master
     environment:
       SPARK_MODE: master
@@ -150,7 +154,10 @@ services:
     volumes: *datalake-volumes
 
   spark-worker:
-    image: bitnamilegacy/spark:3.5.1
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.spark
+    image: datalake-energie/spark:3.5.1
     environment:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
