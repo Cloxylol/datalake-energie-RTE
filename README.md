@@ -161,6 +161,109 @@ l'idempotence du rejeu.
 
 ---
 
+## La couche Gold
+
+Silver unifie, Gold croise. Les trois tables sortent d'une seule jointure,
+sur la clé commune `(ts_utc, zone_id)` : si elle produit des lignes, le
+datalake tient sa promesse. Le schéma complet, colonne par colonne, est
+dans [`docs/gold_schema.md`](docs/gold_schema.md).
+
+**Trois tables.** `mix_horaire` (consommation, production par filière,
+échanges aux frontières et météo, au pas horaire), `kpi_daily` (agrégats
+métier prêts pour la restitution, à la journée **locale**), `ml_features`
+(cible à H+24, lags, calendrier et météo, avec la prévision J-1 de RTE
+conservée comme benchmark du modèle).
+
+**Le job aligne sa fenêtre lui-même.** Un `spark-submit` manuel doit être
+aussi sûr qu'un déclenchement Airflow, donc Gold ne fait pas confiance aux
+bornes qu'il reçoit : il les aligne sur l'unité de partition de la table
+cible. Trois fenêtres, nommées pareil dans
+[`docs/decisions.md`](docs/decisions.md) et dans le code. Demander une
+seule journée les montre toutes les trois :
+
+```
+window_requested : 2024-03-15 -> 2024-03-15
+window_written   : 2024-03-01 -> 2024-03-31   (aligné sur le mois)
+window_read      : 2024-02-22 -> 2024-04-01   (-8 j / +1 j)
+```
+
+Un jour demandé, un mois écrit, quarante jours lus. C'est la démonstration
+la plus courte de l'invariant : *un job n'écrit jamais une partition qu'il
+n'a pas entièrement recalculée.* Écrire le seul 15 mars dans une partition
+mensuelle, en écrasement dynamique, supprimerait les trente autres jours.
+
+`window_read` n'est pas une constante : elle est dérivée de la portée des
+features — 8 jours en amont parce que `lag_168h` remonte à 7 jours et qu'il
+faut une marge d'alignement horaire, 1 jour en aval pour construire la
+cible à H+24. Déclarer un lag plus long allonge la lecture toute seule.
+`window_written`, elle, est matérialisée en sortie dans les colonnes
+`window_start` et `window_end` : une partition dit elle‑même quelle fenêtre
+l'a produite, sans qu'on aille lire les logs du run.
+
+`kpi_daily` agrège par journée locale, ses partitions sont donc des mois
+**locaux** et non UTC — le 31 mars 23:00 UTC est déjà le 1er avril à Paris.
+La borner sur `ts_utc` y ferait entrer une journée d'avril isolée, que
+l'écrasement dynamique substituerait à tout le mois d'avril.
+
+**Production et stockage ne s'additionnent pas.** Le pompage et la charge
+batterie sont des filières **négatives** : les sommer avec la production
+revient à soustraire du parc ce qu'il produit. `generation_total_mw` ne
+retient donc que `filiere_category = production`, le stockage sort à part
+en `storage_net_mw`, signé. Le critère est la colonne portée par Silver,
+pas une liste de noms recopiée dans Gold.
+
+**Les lags sont des décalages en temps, pas en lignes.** Le cadre de
+fenêtre est exprimé en secondes sur `ts_utc` : `lag_24h` est la valeur du
+point situé exactement 24 h avant, et **null** si ce point n'existe pas. Un
+`lag` compté en lignes irait chercher H-23 dans une série trouée et
+l'appellerait `lag_24h` — une erreur silencieuse qui contamine
+l'apprentissage.
+
+**Le schéma ne dépend pas des données.** La liste des filières passée au
+pivot vient de `conf/silver_mapping.yml` via `load_mapping()`, pas d'un
+`distinct` sur le mois traité. Sans elle, un mois sans solaire produirait
+une table sans colonne `solaire`, et deux partitions aux colonnes
+différentes ne se relisent pas ensemble. Les colonnes absentes de la source
+existent et valent null — c'est le comportement voulu.
+
+**Deux colonnes disent la vérité sur la donnée.** `quality_rank` porte le
+**pire** rang des lignes Silver qui ont formé l'heure, côté consommation et
+côté production : une heure moyennée sur du temps réel ne doit pas se
+présenter comme définitive. `n_points` compte sur combien de valeurs non
+nulles la moyenne de l'heure porte réellement — 2 sur le flux définitif,
+qui publie une grille au quart d'heure mais ne renseigne la consommation
+qu'à `:00` et `:30`. Compter les lignes aurait affiché 4 et masqué
+exactement ce que la colonne existe pour révéler.
+
+Lancer un mois :
+
+```bash
+docker compose exec spark-master spark-submit \
+  --master spark://spark-master:7077 \
+  --conf spark.sql.sources.partitionOverwriteMode=dynamic \
+  --conf spark.sql.session.timeZone=UTC \
+  /opt/datalake/src/gold/gold_build.py \
+  --start 2024-03-15 --end 2024-03-15 \
+  --conf /opt/datalake/conf/sources.yml
+```
+
+Le second `--conf`, celui qui suit le chemin du script, est l'argument du
+job et désigne `sources.yml` : ce n'est pas une option Spark. Le mapping
+Silver est cherché à côté de ce fichier, `--mapping` permet de le forcer.
+
+Vérification sans cluster :
+
+```bash
+python src/gold/windows.py
+```
+
+Le module de fenêtrage ne connaît pas Spark, il ne manipule que des dates.
+Il rejoue douze contrôles : alignement sur le mois, dérivation de
+`window_read` depuis les lags déclarés, inclusion de `window_requested`
+dans `window_written`, bascule d'année, février bissextile.
+
+---
+
 ## Idempotence
 
 L'exigence « un DAG interrompu doit pouvoir être relancé sans dupliquer les
@@ -252,6 +355,12 @@ src/silver/
   transform.py                UTC, qualité, dédup, dépivotement, écriture
   silver_grid.py              eco2mix → grid_load + grid_generation
   silver_weather.py           Open-Meteo → weather
+src/gold/
+  windows.py                  les trois fenêtres, en dates pures (sans Spark)
+  gold_build.py               Silver → mix_horaire, kpi_daily, ml_features
+docs/
+  decisions.md                fenêtrage, idempotence, partitionnement
+  gold_schema.md              colonnes des trois tables Gold
 scripts/
   explore_schema.py           découverte des schémas réels
   test_idempotence.py         scénarios d'idempotence sans cluster
@@ -262,7 +371,7 @@ scripts/
 
 - [x] `conf/silver_mapping.yml` — mapping champs source → modèle commun
 - [x] `src/silver/` — validation de schéma, dédup, normalisation UTC, dépivotement des filières
-- [ ] `src/gold/` — `mix_horaire`, `kpi_daily`, `ml_features`
+- [x] `src/gold/` — `mix_horaire`, `kpi_daily`, `ml_features`
 - [ ] `dags/` — DAGs Airflow avec dépendances par Datasets
 - [ ] `notebooks/` — restitution Pandas depuis Gold
 - [ ] `src/ml/` — prévision de consommation à H+24, benchmarkée contre la
