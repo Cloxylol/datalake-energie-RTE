@@ -51,7 +51,21 @@ plus petit dénominateur commun, les mesures infra-horaires y sont moyennées.
 | `forecast_error_mw` | double | `consumption_mw - forecast_j1_mw`. Signé : positif = RTE a sous-estimé. |
 | `co2_rate_g_kwh` | double | Intensité carbone moyenne, gCO2/kWh. |
 | `physical_exchange_mw` | double | Solde des échanges physiques aux frontières. **Négatif = export net.** Sans lui le bilan de l'heure ne boucle pas : la consommation n'égale pas la production nationale. |
-| `n_points` | bigint | Nombre de points Silver tombés dans l'heure : **4** en temps réel (pas de 15 min), **2** en consolidé (pas de 30 min). Une heure à 1 point est une moyenne sur un quart d'heure et rien d'autre ne le dirait. Aucun filtrage n'est appliqué : c'est au lecteur de décider. |
+| `n_points` | bigint | Nombre de points de l'heure où `consumption_mw` est **réellement renseignée** — c'est-à-dire sur combien de valeurs la moyenne de l'heure porte. Voir la note ci-dessous. Aucun filtrage n'est appliqué : c'est au lecteur de décider quoi faire d'une heure incomplète. |
+
+> **`n_points` compte des valeurs, pas des lignes.** La distinction n'est pas
+> théorique : sur le flux **définitif**, eco2mix publie une grille au quart
+> d'heure mais ne renseigne la consommation qu'à `:00` et `:30`. Une heure y
+> compte donc **4 lignes pour 2 valeurs**, et un compteur de lignes
+> afficherait 4 en laissant croire que la moyenne porte sur quatre mesures.
+> Mesuré sur mars 2024 : `n_points = 2` sur les 744 heures. `co2_rate_g_kwh`
+> et `physical_exchange_mw` suivent exactement le même pas, `consumption_mw`
+> sert de référence pour tout le groupe.
+>
+> La valeur attendue dépend donc du flux : **2** en définitif, et jusqu'à
+> **4** sur le flux temps réel, interrogé toutes les 15 minutes. Ce qui se
+> lit dans la colonne n'est pas tant sa valeur absolue que son écart à la
+> valeur habituelle du mois : une heure en dessous est une heure trouée.
 
 ### Production par filière
 
@@ -219,6 +233,6 @@ UTC.
 |---|---|---|
 | `ts_utc`, `ts_local` | timestamp | Horodatages. |
 | `zone_id` | string | Zone. C'est la clé de partitionnement des fenêtres de lag. |
-| `n_points` | bigint | Repris de `mix_horaire` : complétude de l'heure. Permet d'exclure les heures partielles de l'apprentissage sans que Gold ait tranché à la place du modélisateur. |
+| `n_points` | bigint | Repris de `mix_horaire` : sur combien de valeurs non nulles la consommation de l'heure a été moyennée. Permet d'exclure les heures trouées de l'apprentissage sans que Gold ait tranché à la place du modélisateur. |
 | `window_start`, `window_end` | date | `window_written` du run. |
 | `year`, `month` | int | Partitions, dérivées de `ts_utc`. |

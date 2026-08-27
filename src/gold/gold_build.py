@@ -101,12 +101,16 @@ def build_mix_horaire(load: DataFrame, gen: DataFrame, weather: DataFrame,
                    # heure moyennee sur du temps reel ne doit pas se
                    # presenter comme definitive.
                    F.max("quality_rank").alias("quality_rank_load"),
-                   # Combien de points Silver sont tombes dans cette heure.
-                   # 4 pour le temps reel (15 min), 2 pour le consolide
-                   # (30 min) : une heure a 1 point est une moyenne sur un
-                   # quart d'heure, et la moyenne ne le dit pas. Materialise
-                   # plutot que filtre — c'est au lecteur de trancher.
-                   F.count(F.lit(1)).alias("n_points")))
+                   # Sur combien de points la moyenne de l'heure porte
+                   # REELLEMENT. Compter les lignes mentirait : le flux
+                   # definitif est sur une grille au quart d'heure, mais
+                   # seuls :00 et :30 portent une consommation — 4 lignes,
+                   # 2 valeurs. Le compte est donc celui des valeurs non
+                   # nulles, et c'est consumption_mw qui sert de reference :
+                   # co2_rate_g_kwh et physical_exchange_mw suivent le meme
+                   # pas. Materialise plutot que filtre : c'est au lecteur
+                   # de trancher ce qu'il fait d'une heure incomplete.
+                   F.count(F.col("consumption_mw")).alias("n_points")))
 
     # Production : pivot des filieres en colonnes + totaux.
     gen_h = to_hourly(gen).groupBy("ts_hour", "zone_id", "filiere") \
