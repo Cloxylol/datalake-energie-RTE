@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 
 from pyspark.sql import Column, DataFrame, SparkSession, Window
@@ -33,6 +34,9 @@ sys.path.insert(0, "/opt/datalake/src")
 from common.config import Layout, load_config  # noqa: E402
 from gold.windows import (FeatureSpan, TimeWindow, align_to_month,  # noqa: E402
                           reading_window)
+# Lecture seule : le mapping Silver est la source de verite pour la liste des
+# filieres et l'echelle de qualite. Gold les lit, il ne les recopie pas.
+from silver.mapping import SilverMapping, load_mapping, mapping_beside  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)-7s [gold] %(message)s")
@@ -57,8 +61,29 @@ def to_hourly(df: DataFrame, ts_col: str = "ts_utc") -> DataFrame:
     return df.withColumn("ts_hour", F.date_trunc("hour", F.col(ts_col)))
 
 
-def build_mix_horaire(load: DataFrame, gen: DataFrame,
-                      weather: DataFrame) -> DataFrame:
+def expected_filieres(mapping: SilverMapping) -> list[str]:
+    """Les filieres que Silver ecrit reellement, dans l'ordre.
+
+    On interroge le mapping avec ses propres noms de filieres comme s'ils
+    etaient des colonnes source : `resolve_filieres` applique alors ses
+    filtres declares (include_levels, include_categories) et ne rend que ce
+    que grid_generation contient. Les details — eolien_terrestre, gaz_tac —
+    sont ecartes par le mapping lui-meme, sans qu'on redise ici lesquels.
+    """
+    found, _ = mapping.resolve_filieres(list(mapping.filieres))
+    return sorted(found)
+
+
+def quality_label(mapping: SilverMapping, rank: Column) -> Column:
+    """Rang de qualite -> libelle, avec l'echelle declaree dans le mapping."""
+    pairs: list[Column] = []
+    for level, value in sorted(mapping.rank_pairs.items(), key=lambda kv: kv[1]):
+        pairs += [F.lit(value), F.lit(level)]
+    return F.coalesce(F.create_map(*pairs)[rank], F.lit("unknown"))
+
+
+def build_mix_horaire(load: DataFrame, gen: DataFrame, weather: DataFrame,
+                      mapping: SilverMapping) -> DataFrame:
     """La table de jointure : le produit du croisement des sources."""
 
     load_h = (to_hourly(load)
@@ -67,6 +92,15 @@ def build_mix_horaire(load: DataFrame, gen: DataFrame,
                    F.avg("forecast_j1_mw").alias("forecast_j1_mw"),
                    F.avg("forecast_j_mw").alias("forecast_j_mw"),
                    F.avg("co2_rate_g_kwh").alias("co2_rate_g_kwh"),
+                   # Solde des echanges aux frontieres, negatif a l'export.
+                   # Silver le porte depuis le debut ; sans lui le bilan de
+                   # l'heure ne boucle pas : conso != production nationale.
+                   F.avg("physical_exchange_mw").alias("physical_exchange_mw"),
+                   # Qualite de l'heure = la PIRE des lignes qui l'ont
+                   # formee (rang croissant = qualite decroissante). Une
+                   # heure moyennee sur du temps reel ne doit pas se
+                   # presenter comme definitive.
+                   F.max("quality_rank").alias("quality_rank_load"),
                    # Combien de points Silver sont tombes dans cette heure.
                    # 4 pour le temps reel (15 min), 2 pour le consolide
                    # (30 min) : une heure a 1 point est une moyenne sur un
@@ -78,10 +112,17 @@ def build_mix_horaire(load: DataFrame, gen: DataFrame,
     gen_h = to_hourly(gen).groupBy("ts_hour", "zone_id", "filiere") \
                           .agg(F.avg("generation_mw").alias("mw"),
                                F.first("is_renewable").alias("is_renew"),
-                               F.first("filiere_category").alias("category"))
+                               F.first("filiere_category").alias("category"),
+                               F.max("quality_rank").alias("quality_rank"))
 
+    # Liste de filieres passee explicitement au pivot. Deux effets, et le
+    # second est le vrai motif : Spark n'a plus besoin d'un scan distinct
+    # prealable, et surtout le SCHEMA NE DEPEND PLUS DES DONNEES. Un mois
+    # sans solaire produisait sinon une table sans colonne solaire, et deux
+    # partitions aux colonnes differentes ne se relisent pas ensemble.
+    filieres = expected_filieres(mapping)
     pivoted = (gen_h.groupBy("ts_hour", "zone_id")
-               .pivot("filiere")
+               .pivot("filiere", filieres)
                .agg(F.first("mw")))
 
     # Production et stockage ne se somment pas ensemble : le pompage et la
@@ -101,7 +142,8 @@ def build_mix_horaire(load: DataFrame, gen: DataFrame,
                    # Solde du stockage, signe : negatif = le parc absorbe
                    # (pompage, charge), positif = il restitue.
                    F.sum(F.when(is_storage, F.col("mw")))
-                   .alias("storage_net_mw")))
+                   .alias("storage_net_mw"),
+                   F.max("quality_rank").alias("quality_rank_gen")))
 
     weather_h = (to_hourly(weather)
                  .filter(F.col("zone_id") == "fr")
@@ -122,7 +164,18 @@ def build_mix_horaire(load: DataFrame, gen: DataFrame,
                               100 * F.col("generation_renewable_mw")
                               / F.col("generation_total_mw")))
            .withColumn("forecast_error_mw",
-                       F.col("consumption_mw") - F.col("forecast_j1_mw")))
+                       F.col("consumption_mw") - F.col("forecast_j1_mw"))
+           # Qualite de l'heure : le pire des deux flux electriques. La
+           # meteo n'entre pas dans l'indicateur — c'est la qualite de la
+           # mesure RESEAU qu'il annonce, pas celle de la temperature.
+           # Rang ET libelle, comme Silver : le rang se compare, le libelle
+           # se lit dans le notebook.
+           .withColumn("quality_rank",
+                       F.coalesce(F.greatest("quality_rank_load",
+                                             "quality_rank_gen"),
+                                  F.lit(mapping.quality_rank("unknown"))))
+           .withColumn("quality", quality_label(mapping, F.col("quality_rank")))
+           .drop("quality_rank_load", "quality_rank_gen"))
 
     return out.withColumn("year", F.year("ts_utc")) \
               .withColumn("month", F.month("ts_utc"))
@@ -132,16 +185,21 @@ def build_kpi_daily(mix: DataFrame) -> DataFrame:
     """KPIs metier, directement lisibles par le notebook."""
     day = mix.withColumn("date_local", F.to_date("ts_local"))
 
+    # La journee est la cle METIER, mais elle n'est pas la cle : c'est
+    # (date_local, zone_id). Sans zone_id, le pic d'une journee est celui de
+    # la zone la plus consommatrice et les autres disparaissent, puis la
+    # jointure ci-dessous duplique chaque ligne. Une seule zone aujourd'hui
+    # ne rend pas la maille juste, elle rend l'erreur invisible.
     peak = (day.withColumn(
         "_rk", F.row_number().over(
-            Window.partitionBy("date_local")
+            Window.partitionBy("date_local", "zone_id")
                   .orderBy(F.col("consumption_mw").desc_nulls_last())))
         .filter(F.col("_rk") == 1)
-        .select("date_local",
+        .select("date_local", "zone_id",
                 F.col("consumption_mw").alias("peak_mw"),
                 F.hour("ts_local").alias("peak_hour_local")))
 
-    agg = (day.groupBy("date_local").agg(
+    agg = (day.groupBy("date_local", "zone_id").agg(
         (F.sum("consumption_mw") / 1000).alias("consumption_gwh"),
         F.avg("consumption_mw").alias("consumption_avg_mw"),
         F.avg("co2_rate_g_kwh").alias("co2_avg_g_kwh"),
@@ -154,13 +212,16 @@ def build_kpi_daily(mix: DataFrame) -> DataFrame:
         F.when(F.sum("generation_total_mw") > 0,
                100 * F.sum("generation_renewable_mw")
                / F.sum("generation_total_mw")).alias("renewable_share_pct"),
+        F.avg("physical_exchange_mw").alias("physical_exchange_avg_mw"),
         F.avg("temperature_c").alias("temperature_avg_c"),
         F.min("temperature_c").alias("temperature_min_c"),
         F.max("temperature_c").alias("temperature_max_c"),
         F.avg(F.abs("forecast_error_mw")).alias("forecast_mae_mw"),
-        F.count("*").alias("n_hours")))
+        F.count("*").alias("n_hours"),
+        # Le KPI du jour ne vaut pas mieux que la pire heure qui le compose.
+        F.max("quality_rank").alias("quality_rank")))
 
-    return (agg.join(peak, "date_local", "left")
+    return (agg.join(peak, ["date_local", "zone_id"], "left")
             # Degres-jours : la variable qui explique le mieux la conso.
             .withColumn("hdd", F.greatest(F.lit(BASE_TEMP) - F.col("temperature_avg_c"),
                                           F.lit(0.0)))
@@ -219,9 +280,11 @@ def build_ml_features(mix: DataFrame, holidays: list[str] | None = None) -> Data
           .withColumn("dow", F.dayofweek("ts_local"))
           .withColumn("month_of_year", F.month("ts_local"))
           .withColumn("is_weekend", F.col("dow").isin(1, 7).cast("int"))
-          # Encodage cyclique : 23h et 0h sont voisines.
-          .withColumn("hour_sin", F.sin(2 * F.lit(3.14159265) * F.col("hour") / 24))
-          .withColumn("hour_cos", F.cos(2 * F.lit(3.14159265) * F.col("hour") / 24))
+          # Encodage cyclique : 23h et 0h sont voisines. math.pi plutot
+          # qu'une troncature a 8 chiffres : hour_sin(6h) doit valoir 1
+          # exactement, pas 1 - 4e-9.
+          .withColumn("hour_sin", F.sin(2 * F.lit(math.pi) * F.col("hour") / 24))
+          .withColumn("hour_cos", F.cos(2 * F.lit(math.pi) * F.col("hour") / 24))
           .withColumn("hdd", F.greatest(F.lit(BASE_TEMP) - F.col("temperature_c"),
                                         F.lit(0.0)))
           .withColumn("cdd", F.greatest(F.col("temperature_c") - F.lit(BASE_TEMP),
@@ -341,12 +404,20 @@ def main() -> int:
     ap.add_argument("--start", required=True)
     ap.add_argument("--end", required=True)
     ap.add_argument("--conf", default=None)
+    ap.add_argument("--mapping", default=None,
+                    help="chemin de silver_mapping.yml ; par defaut, "
+                         "le voisin de --conf")
     ap.add_argument("--no-holidays", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config(args.conf)
     layout = Layout(root=cfg["hdfs"]["root"])
     fs = cfg["hdfs"]["fs_uri"]
+    # Meme convention que les jobs Silver : le mapping suit --conf.
+    mapping = load_mapping(args.mapping or mapping_beside(args.conf))
+    filieres = expected_filieres(mapping)
+    log.info("Mapping v%s : %d filiere(s) attendue(s) au pivot (%s).",
+             mapping.version, len(filieres), ", ".join(filieres))
 
     # Les trois fenetres, derivees ici et nulle part ailleurs. Le job les
     # calcule lui-meme plutot que de faire confiance a son appelant.
@@ -388,7 +459,7 @@ def main() -> int:
 
     # Calcule sur window_read : les lags du 1er du mois ont besoin des huit
     # jours qui le precedent, la cible du 31 a besoin du 1er du mois suivant.
-    mix_wide = build_mix_horaire(load, gen, weather)
+    mix_wide = build_mix_horaire(load, gen, weather, mapping)
     mix_wide.cache()
 
     # Ecrit sur window_written, et sur elle seule.
