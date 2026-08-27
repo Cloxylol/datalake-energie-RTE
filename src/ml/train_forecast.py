@@ -51,8 +51,13 @@ FEATURES = [
 TARGET = "target_consumption_h24"
 
 
-def load_features(cfg: dict, layout: Layout) -> pd.DataFrame:
-    """Lecture directe du Parquet Gold depuis HDFS via pyarrow."""
+def load_features(cfg: dict, layout: Layout,
+                  gold_dir: str | None = None) -> pd.DataFrame:
+    """Lecture du Parquet ml_features (HDFS, ou dossier local si gold_dir)."""
+    if gold_dir:
+        df = pd.read_parquet(Path(gold_dir) / "ml_features")
+        return df.sort_values("ts_utc").reset_index(drop=True)
+
     path = layout.gold("ml_features")
     host = cfg["hdfs"]["fs_uri"].replace("hdfs://", "").split(":")[0]
     port = int(cfg["hdfs"]["fs_uri"].rsplit(":", 1)[1])
@@ -82,13 +87,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--conf", default=None)
     ap.add_argument("--out", default="./models")
+    ap.add_argument("--gold-dir", default=None,
+                    help="dossier local d'un export de gold/ (au lieu de HDFS)")
     ap.add_argument("--test-frac", type=float, default=0.2)
     args = ap.parse_args()
 
-    cfg = load_config(args.conf)
-    layout = Layout(root=cfg["hdfs"]["root"])
+    if args.gold_dir:
+        cfg, layout = {}, Layout()
+    else:
+        cfg = load_config(args.conf)
+        layout = Layout(root=cfg["hdfs"]["root"])
 
-    df = load_features(cfg, layout)
+    df = load_features(cfg, layout, args.gold_dir)
     log.info("%d lignes, du %s au %s", len(df), df.ts_utc.min(), df.ts_utc.max())
 
     feats = [f for f in FEATURES if f in df.columns]
