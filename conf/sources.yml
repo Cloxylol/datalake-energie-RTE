@@ -1,0 +1,177 @@
+# ---------------------------------------------------------------------------
+# Configuration centrale du datalake.
+# Aucun chemin ni URL en dur dans le code : tout passe par ce fichier.
+# ---------------------------------------------------------------------------
+
+hdfs:
+  # WebHDFS : permet d'ecrire depuis un conteneur sans binaires Hadoop.
+  webhdfs_url: "http://namenode:9870"
+  user: "hadoop"
+  root: "/datalake"
+  # Chemin natif pour les jobs Spark (spark-submit tourne cote cluster).
+  fs_uri: "hdfs://namenode:8020"
+
+kafka:
+  bootstrap_servers: "kafka:9092"
+  topics:
+    eco2mix_tr: "eco2mix.national.tr"
+  # Retention 7 jours : Bronze est la source de verite, Kafka n'est qu'un tampon.
+  retention_ms: 604800000
+
+spark:
+  checkpoint_root: "/datalake/_checkpoints"
+  # Trigger du micro-batch streaming. availableNow = declenchable par Airflow.
+  stream_trigger: "availableNow"
+
+sources:
+
+  # -- Temps reel : polling REST -> Kafka -> Spark SS -> Bronze --------------
+  eco2mix_tr:
+    kind: "stream"
+    dataset_id: "eco2mix-national-tr"
+    api_base: "https://odre.opendatasoft.com/api/explore/v2.1/catalog/datasets"
+    poll_interval_s: 120        # l'API se rafraichit tous les 15 min
+    page_size: 100              # nb de records ramenes par appel
+    lookback_records: 200       # fenetre de recouvrement au demarrage
+    zone_id: "fr"
+    quality: "realtime"
+
+  # -- Batch : CSV consolide/definitif --------------------------------------
+  eco2mix_cons:
+    kind: "batch"
+    dataset_id: "eco2mix-national-cons-def"
+    api_base: "https://odre.opendatasoft.com/api/explore/v2.1/catalog/datasets"
+    export_format: "csv"
+    csv_delimiter: ";"
+    zone_id: "fr"
+    quality: "consolidated"
+    # Bornes disponibles cote RTE (definitif 2012-2020, consolide 2021-2024).
+    available_from: "2012-01-01"
+    available_to: "2024-12-31"
+
+  # -- Batch : archive meteo horaire, sans cle -------------------------------
+  open_meteo:
+    kind: "batch"
+    api_base: "https://archive-api.open-meteo.com/v1/archive"
+    hourly_vars:
+      - "temperature_2m"
+      - "relative_humidity_2m"
+      - "wind_speed_10m"
+      - "cloud_cover"
+    timezone: "UTC"
+    quality: "consolidated"
+
+  # -- Batch : prix spot day-ahead, XML (token gratuit sur demande) ----------
+  entsoe:
+    kind: "batch"
+    api_base: "https://web-api.tp.entsoe.eu/api"
+    document_type: "A44"        # Price Document
+    domain: "10YFR-RTE------C"  # zone de reglage France
+    token_env: "ENTSOE_TOKEN"
+    quality: "consolidated"
+    optional: true              # le pipeline tourne sans, cf. README
+
+# ---------------------------------------------------------------------------
+# Referentiel de zones (alimente silver/dim_zone).
+# La hierarchie parent_zone_id permet de rattacher une meteo municipale
+# a une consommation regionale ou nationale.
+# ---------------------------------------------------------------------------
+zones:
+  - zone_id: "fr"
+    zone_type: "national"
+    label: "France"
+    parent_zone_id: null
+    lat: 46.6034
+    lon: 1.8883
+    weather_proxy: false
+
+  - zone_id: "lyon"
+    zone_type: "city"
+    label: "Lyon"
+    parent_zone_id: "ara"
+    lat: 45.7640
+    lon: 4.8357
+    weather_proxy: true
+
+  - zone_id: "paris"
+    zone_type: "city"
+    label: "Paris"
+    parent_zone_id: "idf"
+    lat: 48.8566
+    lon: 2.3522
+    weather_proxy: true
+
+  - zone_id: "marseille"
+    zone_type: "city"
+    label: "Marseille"
+    parent_zone_id: "paca"
+    lat: 43.2965
+    lon: 5.3698
+    weather_proxy: true
+
+  - zone_id: "lille"
+    zone_type: "city"
+    label: "Lille"
+    parent_zone_id: "hdf"
+    lat: 50.6292
+    lon: 3.0573
+    weather_proxy: true
+
+  - zone_id: "bordeaux"
+    zone_type: "city"
+    label: "Bordeaux"
+    parent_zone_id: "na"
+    lat: 44.8378
+    lon: -0.5792
+    weather_proxy: true
+
+  - zone_id: "ara"
+    zone_type: "region"
+    label: "Auvergne-Rhone-Alpes"
+    parent_zone_id: "fr"
+    lat: 45.5
+    lon: 4.5
+    weather_proxy: false
+
+  - zone_id: "idf"
+    zone_type: "region"
+    label: "Ile-de-France"
+    parent_zone_id: "fr"
+    lat: 48.7
+    lon: 2.5
+    weather_proxy: false
+
+  - zone_id: "paca"
+    zone_type: "region"
+    label: "Provence-Alpes-Cote d'Azur"
+    parent_zone_id: "fr"
+    lat: 43.9
+    lon: 6.0
+    weather_proxy: false
+
+  - zone_id: "hdf"
+    zone_type: "region"
+    label: "Hauts-de-France"
+    parent_zone_id: "fr"
+    lat: 50.0
+    lon: 2.8
+    weather_proxy: false
+
+  - zone_id: "na"
+    zone_type: "region"
+    label: "Nouvelle-Aquitaine"
+    parent_zone_id: "fr"
+    lat: 45.0
+    lon: 0.0
+    weather_proxy: false
+
+# ---------------------------------------------------------------------------
+# Ponderation pour la temperature France = moyenne ponderee des villes.
+# Approximation des poids de consommation regionale.
+# ---------------------------------------------------------------------------
+weather_weights:
+  paris: 0.35
+  lyon: 0.20
+  marseille: 0.15
+  lille: 0.15
+  bordeaux: 0.15

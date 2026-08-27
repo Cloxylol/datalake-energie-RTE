@@ -1,0 +1,185 @@
+# ---------------------------------------------------------------------------
+# Plateforme locale : HDFS + Kafka + Spark + Airflow.
+#
+#   docker compose up -d
+#   docker compose exec airflow-webserver bash
+#
+# Interfaces :
+#   NameNode HDFS   http://localhost:9870
+#   Spark master    http://localhost:8081
+#   Airflow         http://localhost:8080   (admin / admin)
+# ---------------------------------------------------------------------------
+
+x-datalake-volumes: &datalake-volumes
+  - ./src:/opt/datalake/src:ro
+  - ./conf:/opt/datalake/conf:ro
+  - ./dags:/opt/airflow/dags
+  - ./scripts:/opt/datalake/scripts:ro
+
+x-datalake-env: &datalake-env
+  DATALAKE_CONF: /opt/datalake/conf/sources.yml
+  PYTHONPATH: /opt/datalake/src
+  ENTSOE_TOKEN: ${ENTSOE_TOKEN:-}
+
+services:
+
+  # -- HDFS ----------------------------------------------------------------
+  namenode:
+    image: apache/hadoop:3.3.6
+    hostname: namenode
+    command: ["hdfs", "namenode"]
+    ports:
+      - "9870:9870"   # WebHDFS / UI
+      - "8020:8020"   # RPC
+    environment:
+      ENSURE_NAMENODE_DIR: /tmp/hadoop-root/dfs/name
+    env_file: ./docker/hadoop.env
+    volumes:
+      - namenode_data:/tmp/hadoop-root/dfs/name
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  datanode:
+    image: apache/hadoop:3.3.6
+    hostname: datanode
+    command: ["hdfs", "datanode"]
+    env_file: ./docker/hadoop.env
+    volumes:
+      - datanode_data:/tmp/hadoop-root/dfs/data
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  # -- Kafka (mode KRaft, sans ZooKeeper) ----------------------------------
+  kafka:
+    image: bitnami/kafka:3.7
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"   # acces depuis l'hote
+    environment:
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_LOG_RETENTION_MS: "604800000"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # -- Producteur temps reel -----------------------------------------------
+  producer-eco2mix:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    environment: *datalake-env
+    volumes: *datalake-volumes
+    command: >
+      python /opt/datalake/src/ingestion/kafka_producer_eco2mix.py
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -- Spark ---------------------------------------------------------------
+  spark-master:
+    image: bitnami/spark:3.5.1
+    hostname: spark-master
+    environment:
+      SPARK_MODE: master
+      <<: *datalake-env
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes: *datalake-volumes
+
+  spark-worker:
+    image: bitnami/spark:3.5.1
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+      <<: *datalake-env
+    volumes: *datalake-volumes
+    depends_on:
+      - spark-master
+    deploy:
+      replicas: 2
+
+  # -- Airflow -------------------------------------------------------------
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      retries: 5
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      <<: *datalake-env
+    volumes: *datalake-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --password admin
+               --firstname a --lastname b --role Admin --email a@b.c || true"
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    environment: *airflow-env
+    volumes: *datalake-volumes
+    ports:
+      - "8080:8080"
+    command: airflow webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    environment: *airflow-env
+    volumes: *datalake-volumes
+    command: airflow scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  namenode_data:
+  datanode_data:
+  kafka_data:
+  pg_data:

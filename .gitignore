@@ -1,0 +1,46 @@
+# --- Secrets ---------------------------------------------------------------
+# .env contient ENTSOE_TOKEN. Ne jamais committer.
+.env
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Donnees et artefacts --------------------------------------------------
+# Le datalake ne se versionne pas : il se regenere par les jobs.
+data/
+gold_local/
+/tmp/datalake/
+models/
+*.parquet
+*.joblib
+
+# Schema decouvert : genere par explore_schema.py, propre a chaque machine.
+conf/schema_discovered.json
+
+# --- Spark / Hadoop --------------------------------------------------------
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+_SUCCESS
+
+# --- Airflow ---------------------------------------------------------------
+logs/
+airflow.db
+airflow.cfg
+webserver_config.py
+
+# --- Jupyter ---------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- OS / editeurs ---------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,19 @@
+# Ingestion
+requests==2.32.3
+kafka-python==2.0.2
+hdfs==2.7.3
+PyYAML==6.0.2
+
+# Traitement (fourni par l'image Spark en cluster, utile en local)
+pyspark==3.5.1
+
+# Insights
+pandas==2.2.3
+pyarrow==17.0.0
+matplotlib==3.9.2
+seaborn==0.13.2
+jupyter==1.1.1
+
+# Bonus ML
+scikit-learn==1.5.2
+xgboost==2.1.1

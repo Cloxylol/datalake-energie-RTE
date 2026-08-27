@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+ENV PYTHONPATH=/opt/datalake/src \
+    DATALAKE_CONF=/opt/datalake/conf/sources.yml \
+    PYTHONUNBUFFERED=1
+WORKDIR /opt/datalake
