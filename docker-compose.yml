@@ -198,10 +198,29 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: >
-      bash -c "airflow db migrate &&
-               airflow users create --username admin --password admin
-               --firstname a --lastname b --role Admin --email a@b.c || true"
+    # Bloc `|` et forme liste, pas `>`. Le scalaire replie conservait les
+    # retours a la ligne parce que les lignes suivantes etaient plus indentees
+    # que la premiere : `bash -c` recevait TROIS commandes au lieu d'une,
+    # `airflow users create` partait sans ses arguments obligatoires, et
+    # `--firstname` devenait une commande introuvable. Le `|| true` final
+    # avalait l'echec, le conteneur sortait en code 0, et le compte admin
+    # n'existait pas -- sans que rien ne le signale.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        if airflow users list 2>/dev/null | grep -qw admin; then
+          echo "[airflow-init] compte admin deja present."
+        else
+          echo "[airflow-init] creation du compte admin."
+          airflow users create \
+            --username admin --password admin \
+            --firstname a --lastname b \
+            --role Admin --email a@b.c
+        fi
+        echo "[airflow-init] pret."
 
   airflow-webserver:
     build:
