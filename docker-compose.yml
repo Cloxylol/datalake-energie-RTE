@@ -15,6 +15,12 @@ x-datalake-volumes: &datalake-volumes
   - ./conf:/opt/datalake/conf:ro
   - ./dags:/opt/airflow/dags
   - ./scripts:/opt/datalake/scripts:ro
+  # Rapports de validation Silver. Le driver Spark ecrit, Airflow lit : sans
+  # un volume commun aux deux, --report produit un fichier dans un conteneur
+  # que l'autre ne voit pas. Volume NOMME et non bind mount : les deux images
+  # creent le point de montage en mode 1777, ce qui rend l'ecriture possible
+  # quels que soient les uid des conteneurs et l'hote sous-jacent.
+  - reports_data:/opt/datalake/reports
 
 x-datalake-env: &datalake-env
   DATALAKE_CONF: /opt/datalake/conf/sources.yml
@@ -24,15 +30,51 @@ x-datalake-env: &datalake-env
 services:
 
   # -- HDFS ----------------------------------------------------------------
+  # `user: root` : les chemins /tmp/hadoop-root supposent un conteneur root,
+  # mais depuis la 3.3.6 l'image tourne en `hadoop` (uid 1000), qui ne peut
+  # pas ecrire dans un volume nomme cree root. Les repertoires de stockage
+  # sont declares explicitement dans docker/hadoop.env pour ne plus dependre
+  # du tout de l'utilisateur courant.
   namenode:
     image: apache/hadoop:3.3.6
     hostname: namenode
-    command: ["hdfs", "namenode"]
+    user: root
+    # Formatage conditionne a l'absence de METADONNEES, pas a l'absence du
+    # repertoire.
+    #
+    # ENSURE_NAMENODE_DIR, la variable prevue par l'image, teste
+    # `[ ! -d "$$dir" ]`. Or ce repertoire est le point de montage du volume :
+    # il existe toujours, donc le formatage n'avait jamais lieu et le namenode
+    # sortait en code 1 sur InconsistentFSStateException. Deplacer le montage
+    # d'un cran aurait repare ce cas-la, mais aurait garde le defaut de fond :
+    # un test d'existence de repertoire peut redevenir vrai sur un volume
+    # PEUPLE, et un `-format` sur un HDFS peuple le detruit.
+    #
+    # Le marqueur retenu est current/VERSION : il est ecrit par le formatage
+    # lui-meme et c'est le fichier que le NameNode lit au demarrage pour
+    # identifier le namespace (namespaceID, clusterID). Son absence signifie
+    # exactement "aucun namespace ici".
+    #
+    # Second garde-fou : -nonInteractive et jamais -force. Si la condition
+    # ci-dessus se trompait, hdfs namenode -format s'interrompt en trouvant un
+    # current/ peuple au lieu de l'ecraser. Deux barrieres avant toute perte.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        NAME_DIR=/tmp/hadoop-root/dfs/name
+        if [ -f "$$NAME_DIR/current/VERSION" ]; then
+          echo "[namenode] namespace deja present : $$(grep '^clusterID' "$$NAME_DIR/current/VERSION")"
+          echo "[namenode] pas de formatage."
+        else
+          echo "[namenode] aucun current/VERSION sous $$NAME_DIR : formatage initial."
+          hdfs namenode -format -nonInteractive
+        fi
+        exec hdfs namenode
     ports:
       - "9870:9870"   # WebHDFS / UI
       - "8020:8020"   # RPC
-    environment:
-      ENSURE_NAMENODE_DIR: /tmp/hadoop-root/dfs/name
     env_file: ./docker/hadoop.env
     volumes:
       - namenode_data:/tmp/hadoop-root/dfs/name
@@ -45,6 +87,7 @@ services:
   datanode:
     image: apache/hadoop:3.3.6
     hostname: datanode
+    user: root
     command: ["hdfs", "datanode"]
     env_file: ./docker/hadoop.env
     volumes:
@@ -54,8 +97,13 @@ services:
         condition: service_healthy
 
   # -- Kafka (mode KRaft, sans ZooKeeper) ----------------------------------
+  # bitnamilegacy/ et non bitnami/ : Docker Hub a purge les anciens tags
+  # Bitnami en aout 2025, `bitnami/kafka:3.7` ne resout plus et le
+  # `docker compose up` echoue avant de demarrer le moindre conteneur. Meme
+  # lignee d'image, donc les KAFKA_CFG_* ci-dessous restent valides ;
+  # apache/kafka imposerait de reecrire toute la configuration du broker.
   kafka:
-    image: bitnami/kafka:3.7
+    image: bitnamilegacy/kafka:3.7
     hostname: kafka
     ports:
       - "9092:9092"
@@ -94,8 +142,14 @@ services:
     restart: unless-stopped
 
   # -- Spark ---------------------------------------------------------------
+  # Image construite : l'image Bitnami nue n'a pas PyYAML, et common/config.py
+  # l'importe — aucun job Silver ni Gold ne demarre sans. Cf. docker/Dockerfile.spark,
+  # qui porte aussi la bascule bitnami/ -> bitnamilegacy/.
   spark-master:
-    image: bitnami/spark:3.5.1
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.spark
+    image: datalake-energie/spark:3.5.1
     hostname: spark-master
     environment:
       SPARK_MODE: master
@@ -106,7 +160,10 @@ services:
     volumes: *datalake-volumes
 
   spark-worker:
-    image: bitnami/spark:3.5.1
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.spark
+    image: datalake-energie/spark:3.5.1
     environment:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
@@ -147,10 +204,29 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: >
-      bash -c "airflow db migrate &&
-               airflow users create --username admin --password admin
-               --firstname a --lastname b --role Admin --email a@b.c || true"
+    # Bloc `|` et forme liste, pas `>`. Le scalaire replie conservait les
+    # retours a la ligne parce que les lignes suivantes etaient plus indentees
+    # que la premiere : `bash -c` recevait TROIS commandes au lieu d'une,
+    # `airflow users create` partait sans ses arguments obligatoires, et
+    # `--firstname` devenait une commande introuvable. Le `|| true` final
+    # avalait l'echec, le conteneur sortait en code 0, et le compte admin
+    # n'existait pas -- sans que rien ne le signale.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        if airflow users list 2>/dev/null | grep -qw admin; then
+          echo "[airflow-init] compte admin deja present."
+        else
+          echo "[airflow-init] creation du compte admin."
+          airflow users create \
+            --username admin --password admin \
+            --firstname a --lastname b \
+            --role Admin --email a@b.c
+        fi
+        echo "[airflow-init] pret."
 
   airflow-webserver:
     build:
@@ -183,3 +259,4 @@ volumes:
   datanode_data:
   kafka_data:
   pg_data:
+  reports_data:

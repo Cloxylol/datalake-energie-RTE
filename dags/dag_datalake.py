@@ -11,37 +11,98 @@ Deux choix a defendre en soutenance :
    declare ce qu'elle produit (outlets) ; le DAG aval se declenche seul
    quand ses entrees sont fraiches. Aucun sensor ne bloque un worker.
 
-2. IDEMPOTENCE PAR FENETRE. Chaque job recoit data_interval_start et
-   data_interval_end en argument. Un rejeu Airflow d'un intervalle passe
-   retraite exactement les memes donnees et ecrase exactement les memes
-   partitions. Relancer deux fois produit le meme resultat.
+   Un Dataset par TABLE, pas par couche : dag_ml_train n'a besoin que de
+   ml_features, et attendre mix_horaire le ferait partir sur une entree
+   qu'il ne lit pas.
+
+2. IDEMPOTENCE PAR FENETRE. Chaque job recoit une fenetre alignee sur le
+   mois, unite de partition des tables Silver et Gold. Un rejeu Airflow d'un
+   intervalle passe retraite exactement les memes donnees et ecrase
+   exactement les memes partitions. Relancer deux fois produit le meme
+   resultat. Voir docs/decisions.md, qui fait foi.
 
 Le streaming ne rentre pas dans le modele DAG (processus permanent), donc
 on le pilote en micro-batch : trigger availableNow declenche toutes les
 15 minutes. Plus simple a demontrer qu'un job YARN permanent, et suffisant
 pour le debit d'eco2mix.
+
+REJOUER UN MOIS, OU EN CHARGER PLUSIEURS
+
+Les DAGs a fenetre exposent deux parametres, remplissables dans "Trigger DAG
+w/ config" :
+
+    month       AAAA-MM   le mois a traiter, quelle que soit la date du run
+    month_end   AAAA-MM   dernier mois d'un backfill ; vide = un seul mois
+
+Vides, le comportement est celui du run : le mois de son propre intervalle.
+
+Un declenchement manuel depuis l'interface ne peut pas faire autrement que
+prendre l'intervalle courant, qui n'est pas celui des donnees disponibles :
+c'est exactement ce que `month` sert a contourner.
+
+Backfill de deux ans, en ligne de commande. Les DAGs se declenchent en
+cascade par Datasets, mais un run declenche par Dataset ne recoit PAS la
+conf du run amont : il faut donc passer la meme conf aux trois, dans l'ordre,
+en attendant la fin de chacun.
+
+    C='{"month": "2023-01", "month_end": "2024-12"}'
+    docker compose exec airflow-scheduler airflow dags trigger dag_ingest_batch --conf "$C"
+    docker compose exec airflow-scheduler airflow dags trigger dag_silver       --conf "$C"
+    docker compose exec airflow-scheduler airflow dags trigger dag_gold         --conf "$C"
+
+L'ingestion Bronze est reprenable : chaque mois porte son marker _SUCCESS et
+un lot deja telecharge est saute. Une interruption au 14e mois se rattrape en
+relancant la meme commande.
 """
 
 from __future__ import annotations
 
+import calendar
+import json
+import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from airflow import DAG, Dataset
+from airflow.exceptions import AirflowFailException
+from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+
+log = logging.getLogger(__name__)
 
 SRC = "/opt/datalake/src"
 CONF = os.environ.get("DATALAKE_CONF", "/opt/datalake/conf/sources.yml")
+MAPPING = os.environ.get("DATALAKE_SILVER_MAPPING",
+                         "/opt/datalake/conf/silver_mapping.yml")
 SPARK_MASTER = os.environ.get("SPARK_MASTER", "spark://spark-master:7077")
 KAFKA_PKG = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
 
-# Jetons de dependance entre DAGs.
+# Volume partage entre les conteneurs Spark et Airflow (cf. docker-compose.yml).
+# Le driver Spark y ecrit le rapport de validation, la tache Airflow l'y lit.
+REPORTS = "/opt/datalake/reports"
+# ts_nodash et non ds : `ds` est la date LOGIQUE, donc deux runs du meme jour
+# — un declenchement par Dataset et un rejeu manuel, cas courant — ecrivent
+# dans le meme fichier et le second efface le premier. ts_nodash porte
+# l'horodatage complet du run, il est unique.
+REPORT_GRID = REPORTS + "/silver_grid_{{ ts_nodash }}.json"
+REPORT_WEATHER = REPORTS + "/silver_weather_{{ ts_nodash }}.json"
+
+# ---------------------------------------------------------------------------
+# Jetons de dependance entre DAGs : un par TABLE produite.
+# ---------------------------------------------------------------------------
 DS_BRONZE_BATCH = Dataset("hdfs://namenode:8020/datalake/bronze/eco2mix_cons")
 DS_BRONZE_METEO = Dataset("hdfs://namenode:8020/datalake/bronze/meteo_archive")
 DS_BRONZE_STREAM = Dataset("hdfs://namenode:8020/datalake/bronze/eco2mix_tr")
-DS_SILVER = Dataset("hdfs://namenode:8020/datalake/silver/grid_load")
-DS_GOLD = Dataset("hdfs://namenode:8020/datalake/gold/mix_horaire")
+
+DS_SILVER_LOAD = Dataset("hdfs://namenode:8020/datalake/silver/grid_load")
+DS_SILVER_GEN = Dataset("hdfs://namenode:8020/datalake/silver/grid_generation")
+DS_SILVER_WEATHER = Dataset("hdfs://namenode:8020/datalake/silver/weather")
+
+DS_GOLD_MIX = Dataset("hdfs://namenode:8020/datalake/gold/mix_horaire")
+DS_GOLD_KPI = Dataset("hdfs://namenode:8020/datalake/gold/kpi_daily")
+DS_GOLD_ML = Dataset("hdfs://namenode:8020/datalake/gold/ml_features")
 
 DEFAULTS = {
     "owner": "tp-bigdata",
@@ -51,19 +112,196 @@ DEFAULTS = {
     "email_on_failure": False,
 }
 
-# Fenetre passee au job. Les macros Airflow garantissent qu'un rejeu
-# manuel utilise le MEME intervalle que le run d'origine.
-WINDOW = "--start {{ data_interval_start | ds }} --end {{ data_interval_end | ds }}"
+# ---------------------------------------------------------------------------
+# Fenetre passee aux jobs : LE MOIS qui contient le debut de l'intervalle.
+#
+# Deux problemes que cette forme resout, et un piege qu'elle evite.
+#
+# 1. Les tables Silver sont partitionnees par year/month et leurs jobs
+#    ecrivent la fenetre qu'ils recoivent SANS l'aligner eux-memes
+#    (docs/decisions.md : "non — couvert par le DAG"). C'est donc ici que
+#    l'alignement doit se faire. En ecrasement dynamique, ecrire un demi-mois
+#    dans une partition mensuelle ne met pas a jour une moitie : il supprime
+#    l'autre. Gold realigne de son cote, mais recevoir des bornes deja
+#    alignees rend les journaux des deux couches comparables.
+#
+# 2. `data_interval_end` est EXCLUSIVE cote Airflow, alors que tous les jobs
+#    du depot lisent `--end` comme un jour INCLUS : silver.transform.
+#    restrict_window ("bornes de jour incluses"), common.hdfs_io.
+#    partition_months, gold.windows.TimeWindow. La passer telle quelle
+#    ajoutait un jour, et le run du 31 mars debordait sur avril entier.
+#
+# Le piege : corriger le point 2 par `data_interval_end.subtract(days=1)`
+# fabrique une fenetre INVERSEE. Les DAGs declenches par Dataset — silver,
+# gold, ml — n'ont pas d'intervalle de temps : Airflow y pose
+# data_interval_start == data_interval_end. Retrancher un jour a la borne
+# haute la fait passer AVANT la borne basse, et le mois d'avant des que le
+# declenchement tombe un 1er. Constate au rendu : le 2024-03-01 donnait
+# `--start 2024-03-01 --end 2024-02-29`.
+#
+# On ne se sert donc pas du tout de la borne haute d'Airflow. La fenetre est
+# le mois de `data_interval_start`, ce qui donne la meme reponse pour un
+# intervalle quotidien, pour un intervalle mensuel et pour un declenchement
+# par Dataset — et une borne `--end` inclusive par construction.
+# ---------------------------------------------------------------------------
+# Le calcul est en Python et non en Jinja : il porte deux cas et une
+# validation, et un gabarit de trois lignes imbriquees ne se relit pas. Il est
+# expose aux templates par `user_defined_macros`.
+MOIS_FORMAT = r"^$|^\d{4}-(0[1-9]|1[0-2])$"
 
 
-def spark_submit(script: str, args: str = WINDOW, packages: str = "") -> str:
+def _premier_du_mois(valeur: str | None, defaut: date | None = None) -> date | None:
+    """'2024-03' -> date(2024, 3, 1). Vide -> `defaut`."""
+    texte = str(valeur or "").strip()
+    if not texte:
+        return defaut
+    try:
+        annee, mois = (int(part) for part in texte.split("-")[:2])
+        return date(annee, mois, 1)
+    except (TypeError, ValueError) as exc:
+        raise AirflowFailException(
+            f"Mois invalide : {texte!r}. Format attendu AAAA-MM, par exemple "
+            "2024-03."
+        ) from exc
+
+
+def fenetre_mois(params, data_interval_start) -> str:
+    """Les arguments --start / --end du job, alignes sur des mois entiers.
+
+    Trois usages, un seul chemin de code :
+
+      params vides                 le mois de l'intervalle du run
+      month=2024-03                ce mois-la, quelle que soit la date du run
+      month=2023-01 month_end=2024-12   les 24 mois, pour un backfill
+
+    Une fenetre multi-mois reste alignee : chaque partition year/month qu'elle
+    couvre est recalculee en entier, donc l'invariant de docs/decisions.md
+    tient aussi bien sur 24 mois que sur un seul.
+    """
+    par_defaut = date(data_interval_start.year, data_interval_start.month, 1)
+    debut = _premier_du_mois(params.get("month"), defaut=par_defaut)
+    dernier_mois = _premier_du_mois(params.get("month_end"), defaut=debut)
+
+    if dernier_mois < debut:
+        raise AirflowFailException(
+            f"Fenetre inversee : month={debut:%Y-%m} est apres "
+            f"month_end={dernier_mois:%Y-%m}."
+        )
+
+    fin = date(dernier_mois.year, dernier_mois.month,
+               calendar.monthrange(dernier_mois.year, dernier_mois.month)[1])
+    return f"--start {debut.isoformat()} --end {fin.isoformat()}"
+
+
+WINDOW = "{{ fenetre_mois(params, data_interval_start) }}"
+
+MACROS = {"fenetre_mois": fenetre_mois}
+
+# Les deux champs proposes dans "Trigger DAG w/ config". Laisses vides, le DAG
+# se comporte exactement comme avant : le mois de son propre intervalle.
+PARAMS_FENETRE = {
+    "month": Param(
+        default="",
+        type="string",
+        pattern=MOIS_FORMAT,
+        title="Mois a traiter (AAAA-MM)",
+        description="Vide : le mois de l'intervalle du run. Rempli : ce "
+                    "mois-la, quelle que soit la date de declenchement. "
+                    "C'est le champ a remplir pour rejouer un mois passe "
+                    "depuis l'interface.",
+    ),
+    "month_end": Param(
+        default="",
+        type="string",
+        pattern=MOIS_FORMAT,
+        title="Dernier mois d'un backfill (AAAA-MM)",
+        description="Vide : un seul mois, celui ci-dessus. Rempli : traite "
+                    "tous les mois de `month` a `month_end` inclus, en une "
+                    "seule fenetre. Les lots deja ingeres sont sautes grace "
+                    "aux markers _SUCCESS, donc une relance reprend ou elle "
+                    "s'etait arretee.",
+    ),
+}
+
+
+def spark_submit(script: str, args: str = WINDOW, packages: str = "",
+                 extra: str = "") -> str:
     pkg = f"--packages {packages} " if packages else ""
     return (
         f"spark-submit --master {SPARK_MASTER} "
         f"--conf spark.sql.sources.partitionOverwriteMode=dynamic "
         f"--conf spark.sql.session.timeZone=UTC "
-        f"{pkg}{script} {args} --conf {CONF}"
+        f"{pkg}{script} {args} --conf {CONF}{extra}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Lecture des rapports de validation Silver
+# ---------------------------------------------------------------------------
+
+def lire_rapports_silver(grid: str, weather: str, **_) -> dict:
+    """Resume les rapports de quarantaine dans les logs Airflow.
+
+    Les jobs Silver ecrivent deja leur bilan et echouent d'eux-memes au-dela
+    de `max_reject_ratio`. Cette tache ne rejuge donc rien : elle rend le
+    bilan LISIBLE depuis l'interface, sans avoir a ouvrir les logs du driver
+    Spark ni a se connecter a HDFS. C'est la difference entre une quarantaine
+    qui existe et une quarantaine que quelqu'un regarde.
+
+    Elle echoue si AUCUN rapport n'est lisible : un job termine en succes qui
+    n'a rien ecrit est une anomalie en soi.
+    """
+    resume: dict = {}
+    lus = 0
+
+    for label, chemin in (("silver_grid", grid), ("silver_weather", weather)):
+        if not os.path.exists(chemin):
+            log.warning("%s : aucun rapport a %s", label, chemin)
+            resume[label] = None
+            continue
+
+        with open(chemin, encoding="utf-8") as fh:
+            rapport = json.load(fh)
+        lus += 1
+
+        log.info("=== %s | fenetre %s ===", label, rapport.get("window", "?"))
+        entrees = rapport.get("validation", []) or []
+        total_rejets = 0
+        for entree in entrees:
+            total_rejets += entree.get("n_rejected", 0)
+            log.info(
+                "  %-16s <- %-14s %7d lue(s), %7d valide(s), %6d rejetee(s)"
+                " (%.2f %%)",
+                entree.get("table", "?"), entree.get("source", "?"),
+                entree.get("n_input", 0), entree.get("n_valid", 0),
+                entree.get("n_rejected", 0),
+                100 * entree.get("reject_ratio", 0.0),
+            )
+            for motif, n in (entree.get("reasons") or {}).items():
+                log.warning("      motif %-18s %d ligne(s)", motif, n)
+            for champ in (entree.get("missing_measures") or []):
+                log.warning("      mesure absente : %s", champ)
+            for filiere in (entree.get("missing_filieres") or []):
+                log.info("      filiere declaree mais absente : %s", filiere)
+            for note in (entree.get("notes") or []):
+                log.warning("      %s", note)
+
+        resume[label] = {
+            "window": rapport.get("window"),
+            "tables": len(entrees),
+            "n_rejected": total_rejets,
+        }
+        if total_rejets:
+            log.warning("%s : %d ligne(s) en quarantaine, cf. "
+                        "/datalake/silver/_rejects/", label, total_rejets)
+
+    if not lus:
+        raise AirflowFailException(
+            "Aucun rapport de validation Silver lisible. Les jobs ont-ils "
+            f"bien recu --report, et {REPORTS} est-il monte dans les "
+            "conteneurs Spark ET Airflow ?"
+        )
+    return resume
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +315,8 @@ with DAG(
     catchup=False,
     max_active_runs=1,          # jamais deux ingestions concurrentes
     default_args=DEFAULTS,
+    params=PARAMS_FENETRE,
+    user_defined_macros=MACROS,
     tags=["bronze", "batch"],
 ) as dag_ingest:
 
@@ -146,26 +386,48 @@ with DAG(
     dag_id="dag_silver",
     description="Silver : validation, dedup, normalisation UTC",
     start_date=datetime(2024, 3, 1),
-    # Se declenche des que Bronze batch OU streaming est rafraichi.
+    # Une LISTE de Datasets est un ET, pas un OU : le DAG attend que les
+    # TROIS entrees aient ete rafraichies depuis son dernier run. Le
+    # streaming tournant toutes les 15 min, c'est en pratique l'ingestion
+    # quotidienne qui cadence, et le premier tick de streaming qui suit
+    # declenche Silver. Pour un vrai OU, Airflow 2.9 fournit
+    # DatasetAny(...) — c'est un changement de comportement, pas de
+    # commentaire, donc il n'est pas fait ici.
     schedule=[DS_BRONZE_BATCH, DS_BRONZE_METEO, DS_BRONZE_STREAM],
     catchup=False,
     max_active_runs=1,
     default_args=DEFAULTS,
+    params=PARAMS_FENETRE,
+    user_defined_macros=MACROS,
     tags=["silver"],
 ) as dag_silver:
 
+    # Un outlet par table reellement produite : silver_grid en ecrit deux.
     silver_grid = BashOperator(
         task_id="silver_grid",
-        bash_command=spark_submit(f"{SRC}/silver/silver_grid.py"),
-        outlets=[DS_SILVER],
+        bash_command=spark_submit(f"{SRC}/silver/silver_grid.py",
+                                  extra=f" --report {REPORT_GRID}"),
+        outlets=[DS_SILVER_LOAD, DS_SILVER_GEN],
     )
 
     silver_weather = BashOperator(
         task_id="silver_weather",
-        bash_command=spark_submit(f"{SRC}/silver/silver_weather.py"),
+        bash_command=spark_submit(f"{SRC}/silver/silver_weather.py",
+                                  extra=f" --report {REPORT_WEATHER}"),
+        outlets=[DS_SILVER_WEATHER],
     )
 
-    [silver_grid, silver_weather]
+    # all_done : c'est justement quand un job Silver echoue que le rapport de
+    # l'autre est le plus utile. La tache echoue si aucun n'est lisible, et
+    # l'echec du job amont fait de toute facon echouer le run.
+    rapport_qualite = PythonOperator(
+        task_id="rapport_qualite_silver",
+        python_callable=lire_rapports_silver,
+        op_kwargs={"grid": REPORT_GRID, "weather": REPORT_WEATHER},
+        trigger_rule="all_done",
+    )
+
+    [silver_grid, silver_weather] >> rapport_qualite
 
 
 # ---------------------------------------------------------------------------
@@ -175,17 +437,26 @@ with DAG(
     dag_id="dag_gold",
     description="Gold : mix_horaire, kpi_daily, ml_features",
     start_date=datetime(2024, 3, 1),
-    schedule=[DS_SILVER],
+    # ET des trois tables Silver que Gold lit reellement. La jointure est le
+    # produit du croisement des sources : partir avec une seule des trois
+    # fraiche produirait un mix ampute sans que rien ne le signale.
+    schedule=[DS_SILVER_LOAD, DS_SILVER_GEN, DS_SILVER_WEATHER],
     catchup=False,
     max_active_runs=1,
     default_args=DEFAULTS,
+    params=PARAMS_FENETRE,
+    user_defined_macros=MACROS,
     tags=["gold"],
 ) as dag_gold:
 
     BashOperator(
         task_id="build_gold_tables",
-        bash_command=spark_submit(f"{SRC}/gold/gold_build.py"),
-        outlets=[DS_GOLD],
+        # --mapping explicite : le job retomberait sur le voisin de --conf,
+        # mais la liste des filieres du pivot vient de ce fichier et le
+        # schema de mix_horaire en depend. Autant que le DAG le nomme.
+        bash_command=spark_submit(f"{SRC}/gold/gold_build.py",
+                                  extra=f" --mapping {MAPPING}"),
+        outlets=[DS_GOLD_MIX, DS_GOLD_KPI, DS_GOLD_ML],
     )
 
 
@@ -196,7 +467,8 @@ with DAG(
     dag_id="dag_ml_train",
     description="Bonus : prevision de consommation a H+24",
     start_date=datetime(2024, 3, 1),
-    schedule=[DS_GOLD],
+    # ml_features et elle seule : c'est la seule table que train_forecast lit.
+    schedule=[DS_GOLD_ML],
     catchup=False,
     default_args=DEFAULTS,
     tags=["ml", "bonus"],

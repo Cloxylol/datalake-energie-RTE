@@ -3,9 +3,23 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-17-jre-headless procps && rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+# Meme point de montage et memes droits que dans docker/Dockerfile.spark : le
+# volume nomme des rapports herite du premier conteneur qui le cree, les deux
+# images doivent donc s'accorder.
+RUN mkdir -p /opt/datalake/reports && chmod 1777 /opt/datalake/reports
 USER airflow
+# pyspark EPINGLE a la version du cluster. Sans cette ligne, le provider Spark
+# tire la derniere pyspark publiee (4.2.0 au moment ou ceci est ecrit), et
+# c'est ce spark-submit-la qui se retrouve dans le PATH d'Airflow. Le client
+# parle alors une autre version que spark-master, et TOUTES les taches
+# spark_submit du projet meurent sur :
+#   java.io.InvalidClassException: ...RpcEndpointVerifier$CheckExistence;
+#   local class incompatible: stream classdesc serialVersionUID = ...
+# La panne ne se voit pas en lancant depuis le conteneur Spark, seulement
+# depuis Airflow : c'est le client qui differe, pas le cluster.
 RUN pip install --no-cache-dir \
     apache-airflow-providers-apache-spark==4.8.1 \
+    pyspark==3.5.1 \
     hdfs==2.7.3 requests==2.32.3 kafka-python==2.0.2 PyYAML==6.0.2
 ENV PYTHONPATH=/opt/datalake/src \
     DATALAKE_CONF=/opt/datalake/conf/sources.yml
