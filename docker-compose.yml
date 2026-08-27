@@ -54,8 +54,13 @@ services:
         condition: service_healthy
 
   # -- Kafka (mode KRaft, sans ZooKeeper) ----------------------------------
+  # bitnamilegacy/ et non bitnami/ : Docker Hub a purge les anciens tags
+  # Bitnami en aout 2025, `bitnami/kafka:3.7` ne resout plus et le
+  # `docker compose up` echoue avant de demarrer le moindre conteneur. Meme
+  # lignee d'image, donc les KAFKA_CFG_* ci-dessous restent valides ;
+  # apache/kafka imposerait de reecrire toute la configuration du broker.
   kafka:
-    image: bitnami/kafka:3.7
+    image: bitnamilegacy/kafka:3.7
     hostname: kafka
     ports:
       - "9092:9092"
@@ -94,8 +99,10 @@ services:
     restart: unless-stopped
 
   # -- Spark ---------------------------------------------------------------
+  # bitnamilegacy/ : meme purge Docker Hub que pour Kafka ci-dessus. SPARK_MODE
+  # est une variable propre a cette lignee d'image, elle la suit.
   spark-master:
-    image: bitnami/spark:3.5.1
+    image: bitnamilegacy/spark:3.5.1
     hostname: spark-master
     environment:
       SPARK_MODE: master
@@ -106,7 +113,7 @@ services:
     volumes: *datalake-volumes
 
   spark-worker:
-    image: bitnami/spark:3.5.1
+    image: bitnamilegacy/spark:3.5.1
     environment:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
