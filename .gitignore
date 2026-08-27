@@ -38,9 +38,15 @@ webserver_config.py
 # --- Jupyter ---------------------------------------------------------------
 .ipynb_checkpoints/
 
+# --- Compose ---------------------------------------------------------------
+# Surcharge locale des ports publies. Les conflits dependent de ce qui tourne
+# deja sur le poste : ce fichier n'a de sens que sur la machine qui le cree.
+docker-compose.override.yml
+
 # --- OS / editeurs ---------------------------------------------------------
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 *.swp
+CLAUDE.md
