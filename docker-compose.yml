@@ -24,9 +24,15 @@ x-datalake-env: &datalake-env
 services:
 
   # -- HDFS ----------------------------------------------------------------
+  # `user: root` : les chemins /tmp/hadoop-root supposent un conteneur root,
+  # mais depuis la 3.3.6 l'image tourne en `hadoop` (uid 1000), qui ne peut
+  # pas ecrire dans un volume nomme cree root. Les repertoires de stockage
+  # sont declares explicitement dans docker/hadoop.env pour ne plus dependre
+  # du tout de l'utilisateur courant.
   namenode:
     image: apache/hadoop:3.3.6
     hostname: namenode
+    user: root
     command: ["hdfs", "namenode"]
     ports:
       - "9870:9870"   # WebHDFS / UI
@@ -45,6 +51,7 @@ services:
   datanode:
     image: apache/hadoop:3.3.6
     hostname: datanode
+    user: root
     command: ["hdfs", "datanode"]
     env_file: ./docker/hadoop.env
     volumes:
