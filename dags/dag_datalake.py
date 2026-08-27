@@ -11,6 +11,10 @@ Deux choix a defendre en soutenance :
    declare ce qu'elle produit (outlets) ; le DAG aval se declenche seul
    quand ses entrees sont fraiches. Aucun sensor ne bloque un worker.
 
+   Un Dataset par TABLE, pas par couche : dag_ml_train n'a besoin que de
+   ml_features, et attendre mix_horaire le ferait partir sur une entree
+   qu'il ne lit pas.
+
 2. IDEMPOTENCE PAR FENETRE. Chaque job recoit une fenetre alignee sur le
    mois, unite de partition des tables Silver et Gold. Un rejeu Airflow d'un
    intervalle passe retraite exactement les memes donnees et ecrase
@@ -68,12 +72,20 @@ CONF = os.environ.get("DATALAKE_CONF", "/opt/datalake/conf/sources.yml")
 SPARK_MASTER = os.environ.get("SPARK_MASTER", "spark://spark-master:7077")
 KAFKA_PKG = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
 
-# Jetons de dependance entre DAGs.
+# ---------------------------------------------------------------------------
+# Jetons de dependance entre DAGs : un par TABLE produite.
+# ---------------------------------------------------------------------------
 DS_BRONZE_BATCH = Dataset("hdfs://namenode:8020/datalake/bronze/eco2mix_cons")
 DS_BRONZE_METEO = Dataset("hdfs://namenode:8020/datalake/bronze/meteo_archive")
 DS_BRONZE_STREAM = Dataset("hdfs://namenode:8020/datalake/bronze/eco2mix_tr")
-DS_SILVER = Dataset("hdfs://namenode:8020/datalake/silver/grid_load")
-DS_GOLD = Dataset("hdfs://namenode:8020/datalake/gold/mix_horaire")
+
+DS_SILVER_LOAD = Dataset("hdfs://namenode:8020/datalake/silver/grid_load")
+DS_SILVER_GEN = Dataset("hdfs://namenode:8020/datalake/silver/grid_generation")
+DS_SILVER_WEATHER = Dataset("hdfs://namenode:8020/datalake/silver/weather")
+
+DS_GOLD_MIX = Dataset("hdfs://namenode:8020/datalake/gold/mix_horaire")
+DS_GOLD_KPI = Dataset("hdfs://namenode:8020/datalake/gold/kpi_daily")
+DS_GOLD_ML = Dataset("hdfs://namenode:8020/datalake/gold/ml_features")
 
 DEFAULTS = {
     "owner": "tp-bigdata",
@@ -287,7 +299,13 @@ with DAG(
     dag_id="dag_silver",
     description="Silver : validation, dedup, normalisation UTC",
     start_date=datetime(2024, 3, 1),
-    # Se declenche des que Bronze batch OU streaming est rafraichi.
+    # Une LISTE de Datasets est un ET, pas un OU : le DAG attend que les
+    # TROIS entrees aient ete rafraichies depuis son dernier run. Le
+    # streaming tournant toutes les 15 min, c'est en pratique l'ingestion
+    # quotidienne qui cadence, et le premier tick de streaming qui suit
+    # declenche Silver. Pour un vrai OU, Airflow 2.9 fournit
+    # DatasetAny(...) — c'est un changement de comportement, pas de
+    # commentaire, donc il n'est pas fait ici.
     schedule=[DS_BRONZE_BATCH, DS_BRONZE_METEO, DS_BRONZE_STREAM],
     catchup=False,
     max_active_runs=1,
@@ -297,15 +315,17 @@ with DAG(
     tags=["silver"],
 ) as dag_silver:
 
+    # Un outlet par table reellement produite : silver_grid en ecrit deux.
     silver_grid = BashOperator(
         task_id="silver_grid",
         bash_command=spark_submit(f"{SRC}/silver/silver_grid.py"),
-        outlets=[DS_SILVER],
+        outlets=[DS_SILVER_LOAD, DS_SILVER_GEN],
     )
 
     silver_weather = BashOperator(
         task_id="silver_weather",
         bash_command=spark_submit(f"{SRC}/silver/silver_weather.py"),
+        outlets=[DS_SILVER_WEATHER],
     )
 
     [silver_grid, silver_weather]
@@ -318,7 +338,10 @@ with DAG(
     dag_id="dag_gold",
     description="Gold : mix_horaire, kpi_daily, ml_features",
     start_date=datetime(2024, 3, 1),
-    schedule=[DS_SILVER],
+    # ET des trois tables Silver que Gold lit reellement. La jointure est le
+    # produit du croisement des sources : partir avec une seule des trois
+    # fraiche produirait un mix ampute sans que rien ne le signale.
+    schedule=[DS_SILVER_LOAD, DS_SILVER_GEN, DS_SILVER_WEATHER],
     catchup=False,
     max_active_runs=1,
     default_args=DEFAULTS,
@@ -330,7 +353,7 @@ with DAG(
     BashOperator(
         task_id="build_gold_tables",
         bash_command=spark_submit(f"{SRC}/gold/gold_build.py"),
-        outlets=[DS_GOLD],
+        outlets=[DS_GOLD_MIX, DS_GOLD_KPI, DS_GOLD_ML],
     )
 
 
@@ -341,7 +364,8 @@ with DAG(
     dag_id="dag_ml_train",
     description="Bonus : prevision de consommation a H+24",
     start_date=datetime(2024, 3, 1),
-    schedule=[DS_GOLD],
+    # ml_features et elle seule : c'est la seule table que train_forecast lit.
+    schedule=[DS_GOLD_ML],
     catchup=False,
     default_args=DEFAULTS,
     tags=["ml", "bonus"],
