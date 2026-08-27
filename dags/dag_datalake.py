@@ -69,6 +69,8 @@ from airflow.operators.empty import EmptyOperator
 
 SRC = "/opt/datalake/src"
 CONF = os.environ.get("DATALAKE_CONF", "/opt/datalake/conf/sources.yml")
+MAPPING = os.environ.get("DATALAKE_SILVER_MAPPING",
+                         "/opt/datalake/conf/silver_mapping.yml")
 SPARK_MASTER = os.environ.get("SPARK_MASTER", "spark://spark-master:7077")
 KAFKA_PKG = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
 
@@ -207,13 +209,14 @@ PARAMS_FENETRE = {
 }
 
 
-def spark_submit(script: str, args: str = WINDOW, packages: str = "") -> str:
+def spark_submit(script: str, args: str = WINDOW, packages: str = "",
+                 extra: str = "") -> str:
     pkg = f"--packages {packages} " if packages else ""
     return (
         f"spark-submit --master {SPARK_MASTER} "
         f"--conf spark.sql.sources.partitionOverwriteMode=dynamic "
         f"--conf spark.sql.session.timeZone=UTC "
-        f"{pkg}{script} {args} --conf {CONF}"
+        f"{pkg}{script} {args} --conf {CONF}{extra}"
     )
 
 
@@ -352,7 +355,11 @@ with DAG(
 
     BashOperator(
         task_id="build_gold_tables",
-        bash_command=spark_submit(f"{SRC}/gold/gold_build.py"),
+        # --mapping explicite : le job retomberait sur le voisin de --conf,
+        # mais la liste des filieres du pivot vient de ce fichier et le
+        # schema de mix_horaire en depend. Autant que le DAG le nomme.
+        bash_command=spark_submit(f"{SRC}/gold/gold_build.py",
+                                  extra=f" --mapping {MAPPING}"),
         outlets=[DS_GOLD_MIX, DS_GOLD_KPI, DS_GOLD_ML],
     )
 
