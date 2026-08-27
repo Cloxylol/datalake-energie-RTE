@@ -409,6 +409,23 @@ def _load_raw(path: str) -> dict[str, Any]:
     return raw
 
 
+def mapping_beside(conf_path: str | Path | None) -> Path | None:
+    """Mapping voisin d'un sources.yml donne, ou None pour le defaut.
+
+    Les jobs recoivent --conf : le mapping doit suivre le meme repertoire,
+    sinon une conf de test irait chercher le mapping de production, celui
+    que designe DATALAKE_CONF.
+
+    Le voisin n'est retenu que s'il existe reellement. Une conf posee
+    ailleurs sans mapping a cote retombe sur le defaut plutot que de faire
+    echouer le job : le mapping explicite reste possible via --mapping.
+    """
+    if not conf_path:
+        return None
+    candidate = Path(conf_path).parent / "silver_mapping.yml"
+    return candidate if candidate.exists() else None
+
+
 def load_mapping(path: str | Path | None = None) -> SilverMapping:
     """Charge le mapping. Mis en cache : appelable librement."""
     return SilverMapping(_load_raw(str(path or DEFAULT_MAPPING)))

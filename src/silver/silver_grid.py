@@ -42,7 +42,9 @@ from pyspark.sql import functions as F
 sys.path.insert(0, "/opt/datalake/src")
 
 from common.config import Layout, load_config  # noqa: E402
-from silver.mapping import SilverMapping, load_mapping  # noqa: E402
+from silver.mapping import (  # noqa: E402
+    SilverMapping, load_mapping, mapping_beside,
+)
 from silver.readers import read_source  # noqa: E402
 from silver.transform import (  # noqa: E402
     add_partitions, dedupe, normalize_time, derive_quality, restrict_window,
@@ -200,7 +202,8 @@ def main() -> int:
     ap.add_argument("--end", required=True)
     ap.add_argument("--conf", default=None)
     ap.add_argument("--mapping", default=None,
-                    help="chemin de silver_mapping.yml")
+                    help="chemin de silver_mapping.yml ; par defaut, "
+                         "le voisin de --conf")
     ap.add_argument("--report", default=None,
                     help="ecrit le bilan de validation en JSON")
     args = ap.parse_args()
@@ -208,7 +211,9 @@ def main() -> int:
     cfg = load_config(args.conf)
     layout = Layout(root=cfg["hdfs"]["root"])
     fs = cfg["hdfs"]["fs_uri"]
-    mapping = load_mapping(args.mapping)
+    # Le mapping suit --conf : passer une conf de test ne doit pas aller
+    # rechercher le mapping de production a cote de DATALAKE_CONF.
+    mapping = load_mapping(args.mapping or mapping_beside(args.conf))
     log.info("Mapping Silver v%s : %d table(s), %d filiere(s) declaree(s).",
              mapping.version, len(mapping.tables), len(mapping.filieres))
 

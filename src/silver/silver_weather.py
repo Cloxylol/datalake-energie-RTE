@@ -46,7 +46,9 @@ from pyspark.sql import functions as F
 sys.path.insert(0, "/opt/datalake/src")
 
 from common.config import Layout, load_config  # noqa: E402
-from silver.mapping import SilverMapping, load_mapping  # noqa: E402
+from silver.mapping import (  # noqa: E402
+    SilverMapping, load_mapping, mapping_beside,
+)
 from silver.readers import read_source  # noqa: E402
 from silver.transform import (  # noqa: E402
     add_partitions, dedupe, restrict_window, write_silver,
@@ -239,14 +241,18 @@ def main() -> int:
     ap.add_argument("--start", required=True)
     ap.add_argument("--end", required=True)
     ap.add_argument("--conf", default=None)
-    ap.add_argument("--mapping", default=None)
+    ap.add_argument("--mapping", default=None,
+                    help="chemin de silver_mapping.yml ; par defaut, "
+                         "le voisin de --conf")
     ap.add_argument("--report", default=None)
     args = ap.parse_args()
 
     cfg = load_config(args.conf)
     layout = Layout(root=cfg["hdfs"]["root"])
     fs = cfg["hdfs"]["fs_uri"]
-    mapping = load_mapping(args.mapping)
+    # Le mapping suit --conf : passer une conf de test ne doit pas aller
+    # rechercher le mapping de production a cote de DATALAKE_CONF.
+    mapping = load_mapping(args.mapping or mapping_beside(args.conf))
 
     spark = (SparkSession.builder.appName("silver-weather")
              .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
