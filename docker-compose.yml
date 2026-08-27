@@ -15,6 +15,12 @@ x-datalake-volumes: &datalake-volumes
   - ./conf:/opt/datalake/conf:ro
   - ./dags:/opt/airflow/dags
   - ./scripts:/opt/datalake/scripts:ro
+  # Rapports de validation Silver. Le driver Spark ecrit, Airflow lit : sans
+  # un volume commun aux deux, --report produit un fichier dans un conteneur
+  # que l'autre ne voit pas. Volume NOMME et non bind mount : les deux images
+  # creent le point de montage en mode 1777, ce qui rend l'ecriture possible
+  # quels que soient les uid des conteneurs et l'hote sous-jacent.
+  - reports_data:/opt/datalake/reports
 
 x-datalake-env: &datalake-env
   DATALAKE_CONF: /opt/datalake/conf/sources.yml
@@ -253,3 +259,4 @@ volumes:
   datanode_data:
   kafka_data:
   pg_data:
+  reports_data:

@@ -58,6 +58,8 @@ relancant la meme commande.
 from __future__ import annotations
 
 import calendar
+import json
+import logging
 import os
 from datetime import date, datetime, timedelta
 
@@ -66,6 +68,9 @@ from airflow.exceptions import AirflowFailException
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+
+log = logging.getLogger(__name__)
 
 SRC = "/opt/datalake/src"
 CONF = os.environ.get("DATALAKE_CONF", "/opt/datalake/conf/sources.yml")
@@ -73,6 +78,16 @@ MAPPING = os.environ.get("DATALAKE_SILVER_MAPPING",
                          "/opt/datalake/conf/silver_mapping.yml")
 SPARK_MASTER = os.environ.get("SPARK_MASTER", "spark://spark-master:7077")
 KAFKA_PKG = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+
+# Volume partage entre les conteneurs Spark et Airflow (cf. docker-compose.yml).
+# Le driver Spark y ecrit le rapport de validation, la tache Airflow l'y lit.
+REPORTS = "/opt/datalake/reports"
+# ts_nodash et non ds : `ds` est la date LOGIQUE, donc deux runs du meme jour
+# — un declenchement par Dataset et un rejeu manuel, cas courant — ecrivent
+# dans le meme fichier et le second efface le premier. ts_nodash porte
+# l'horodatage complet du run, il est unique.
+REPORT_GRID = REPORTS + "/silver_grid_{{ ts_nodash }}.json"
+REPORT_WEATHER = REPORTS + "/silver_weather_{{ ts_nodash }}.json"
 
 # ---------------------------------------------------------------------------
 # Jetons de dependance entre DAGs : un par TABLE produite.
@@ -221,6 +236,75 @@ def spark_submit(script: str, args: str = WINDOW, packages: str = "",
 
 
 # ---------------------------------------------------------------------------
+# Lecture des rapports de validation Silver
+# ---------------------------------------------------------------------------
+
+def lire_rapports_silver(grid: str, weather: str, **_) -> dict:
+    """Resume les rapports de quarantaine dans les logs Airflow.
+
+    Les jobs Silver ecrivent deja leur bilan et echouent d'eux-memes au-dela
+    de `max_reject_ratio`. Cette tache ne rejuge donc rien : elle rend le
+    bilan LISIBLE depuis l'interface, sans avoir a ouvrir les logs du driver
+    Spark ni a se connecter a HDFS. C'est la difference entre une quarantaine
+    qui existe et une quarantaine que quelqu'un regarde.
+
+    Elle echoue si AUCUN rapport n'est lisible : un job termine en succes qui
+    n'a rien ecrit est une anomalie en soi.
+    """
+    resume: dict = {}
+    lus = 0
+
+    for label, chemin in (("silver_grid", grid), ("silver_weather", weather)):
+        if not os.path.exists(chemin):
+            log.warning("%s : aucun rapport a %s", label, chemin)
+            resume[label] = None
+            continue
+
+        with open(chemin, encoding="utf-8") as fh:
+            rapport = json.load(fh)
+        lus += 1
+
+        log.info("=== %s | fenetre %s ===", label, rapport.get("window", "?"))
+        entrees = rapport.get("validation", []) or []
+        total_rejets = 0
+        for entree in entrees:
+            total_rejets += entree.get("n_rejected", 0)
+            log.info(
+                "  %-16s <- %-14s %7d lue(s), %7d valide(s), %6d rejetee(s)"
+                " (%.2f %%)",
+                entree.get("table", "?"), entree.get("source", "?"),
+                entree.get("n_input", 0), entree.get("n_valid", 0),
+                entree.get("n_rejected", 0),
+                100 * entree.get("reject_ratio", 0.0),
+            )
+            for motif, n in (entree.get("reasons") or {}).items():
+                log.warning("      motif %-18s %d ligne(s)", motif, n)
+            for champ in (entree.get("missing_measures") or []):
+                log.warning("      mesure absente : %s", champ)
+            for filiere in (entree.get("missing_filieres") or []):
+                log.info("      filiere declaree mais absente : %s", filiere)
+            for note in (entree.get("notes") or []):
+                log.warning("      %s", note)
+
+        resume[label] = {
+            "window": rapport.get("window"),
+            "tables": len(entrees),
+            "n_rejected": total_rejets,
+        }
+        if total_rejets:
+            log.warning("%s : %d ligne(s) en quarantaine, cf. "
+                        "/datalake/silver/_rejects/", label, total_rejets)
+
+    if not lus:
+        raise AirflowFailException(
+            "Aucun rapport de validation Silver lisible. Les jobs ont-ils "
+            f"bien recu --report, et {REPORTS} est-il monte dans les "
+            "conteneurs Spark ET Airflow ?"
+        )
+    return resume
+
+
+# ---------------------------------------------------------------------------
 # 1. Ingestion batch
 # ---------------------------------------------------------------------------
 with DAG(
@@ -321,17 +405,29 @@ with DAG(
     # Un outlet par table reellement produite : silver_grid en ecrit deux.
     silver_grid = BashOperator(
         task_id="silver_grid",
-        bash_command=spark_submit(f"{SRC}/silver/silver_grid.py"),
+        bash_command=spark_submit(f"{SRC}/silver/silver_grid.py",
+                                  extra=f" --report {REPORT_GRID}"),
         outlets=[DS_SILVER_LOAD, DS_SILVER_GEN],
     )
 
     silver_weather = BashOperator(
         task_id="silver_weather",
-        bash_command=spark_submit(f"{SRC}/silver/silver_weather.py"),
+        bash_command=spark_submit(f"{SRC}/silver/silver_weather.py",
+                                  extra=f" --report {REPORT_WEATHER}"),
         outlets=[DS_SILVER_WEATHER],
     )
 
-    [silver_grid, silver_weather]
+    # all_done : c'est justement quand un job Silver echoue que le rapport de
+    # l'autre est le plus utile. La tache echoue si aucun n'est lisible, et
+    # l'echec du job amont fait de toute facon echouer le run.
+    rapport_qualite = PythonOperator(
+        task_id="rapport_qualite_silver",
+        python_callable=lire_rapports_silver,
+        op_kwargs={"grid": REPORT_GRID, "weather": REPORT_WEATHER},
+        trigger_rule="all_done",
+    )
+
+    [silver_grid, silver_weather] >> rapport_qualite
 
 
 # ---------------------------------------------------------------------------

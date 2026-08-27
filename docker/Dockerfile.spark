@@ -23,4 +23,10 @@ RUN install_packages python3-pip 2>/dev/null || true; \
         PyYAML==6.0.2 requests==2.32.3 \
     || pip install --no-cache-dir PyYAML==6.0.2 requests==2.32.3
 
+# Point de montage du volume partage des rapports de validation Silver. Cree
+# ici en 1777 : un volume nomme herite des droits du repertoire present dans
+# l'image, donc le driver Spark (uid 1001) et Airflow (uid 50000) peuvent tous
+# deux y ecrire, sur n'importe quel hote.
+RUN mkdir -p /opt/datalake/reports && chmod 1777 /opt/datalake/reports
+
 USER 1001

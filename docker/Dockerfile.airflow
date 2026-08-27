@@ -3,6 +3,10 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-17-jre-headless procps && rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+# Meme point de montage et memes droits que dans docker/Dockerfile.spark : le
+# volume nomme des rapports herite du premier conteneur qui le cree, les deux
+# images doivent donc s'accorder.
+RUN mkdir -p /opt/datalake/reports && chmod 1777 /opt/datalake/reports
 USER airflow
 # pyspark EPINGLE a la version du cluster. Sans cette ligne, le provider Spark
 # tire la derniere pyspark publiee (4.2.0 au moment ou ceci est ecrit), et
