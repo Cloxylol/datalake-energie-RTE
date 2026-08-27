@@ -33,12 +33,42 @@ services:
     image: apache/hadoop:3.3.6
     hostname: namenode
     user: root
-    command: ["hdfs", "namenode"]
+    # Formatage conditionne a l'absence de METADONNEES, pas a l'absence du
+    # repertoire.
+    #
+    # ENSURE_NAMENODE_DIR, la variable prevue par l'image, teste
+    # `[ ! -d "$$dir" ]`. Or ce repertoire est le point de montage du volume :
+    # il existe toujours, donc le formatage n'avait jamais lieu et le namenode
+    # sortait en code 1 sur InconsistentFSStateException. Deplacer le montage
+    # d'un cran aurait repare ce cas-la, mais aurait garde le defaut de fond :
+    # un test d'existence de repertoire peut redevenir vrai sur un volume
+    # PEUPLE, et un `-format` sur un HDFS peuple le detruit.
+    #
+    # Le marqueur retenu est current/VERSION : il est ecrit par le formatage
+    # lui-meme et c'est le fichier que le NameNode lit au demarrage pour
+    # identifier le namespace (namespaceID, clusterID). Son absence signifie
+    # exactement "aucun namespace ici".
+    #
+    # Second garde-fou : -nonInteractive et jamais -force. Si la condition
+    # ci-dessus se trompait, hdfs namenode -format s'interrompt en trouvant un
+    # current/ peuple au lieu de l'ecraser. Deux barrieres avant toute perte.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        NAME_DIR=/tmp/hadoop-root/dfs/name
+        if [ -f "$$NAME_DIR/current/VERSION" ]; then
+          echo "[namenode] namespace deja present : $$(grep '^clusterID' "$$NAME_DIR/current/VERSION")"
+          echo "[namenode] pas de formatage."
+        else
+          echo "[namenode] aucun current/VERSION sous $$NAME_DIR : formatage initial."
+          hdfs namenode -format -nonInteractive
+        fi
+        exec hdfs namenode
     ports:
       - "9870:9870"   # WebHDFS / UI
       - "8020:8020"   # RPC
-    environment:
-      ENSURE_NAMENODE_DIR: /tmp/hadoop-root/dfs/name
     env_file: ./docker/hadoop.env
     volumes:
       - namenode_data:/tmp/hadoop-root/dfs/name
