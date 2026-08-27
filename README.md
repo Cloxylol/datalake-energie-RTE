@@ -80,6 +80,87 @@ docker compose exec namenode hdfs dfs -cat \
 
 ---
 
+## La couche Silver
+
+Bronze conserve trois formats bruts. Silver en fait un modèle commun, et
+tout ce qu'elle fait est déclaré dans `conf/silver_mapping.yml` : le code
+de `src/silver/` ne contient aucun nom de champ source en dur. Quand RTE
+ajoute une filière ou renomme une colonne, on édite le YAML.
+
+**Trois tables.** `grid_load` (consommation, prévisions RTE, intensité
+carbone), `grid_generation` (une ligne par filière), `weather` (météo
+horaire par ville + agrégat national pondéré). Toutes portent la clé
+commune `(ts_utc, zone_id)` et les colonnes de traçabilité
+`source / quality / ingested_at / source_file`.
+
+**Validation de schéma, avec quarantaine.** Une ligne qui ne respecte pas
+le contrat n'est jamais supprimée en silence : elle part dans
+`/datalake/silver/_rejects/<table>/` avec son motif, sa colonne fautive et
+sa charge utile complète. Quatre motifs : `null_key`, `cast_failed`,
+`out_of_range`, `unexpected_value`. Au-delà de `max_reject_ratio` (25 %),
+le job échoue plutôt que de publier une table amputée — un taux pareil
+signale un mapping cassé, pas des données sales.
+
+Hors bornes, deux traitements selon le mapping : `reject` sort la ligne
+(une consommation de 200 GW invalide tout le reste), `null_out` neutralise
+la seule mesure (une prévision aberrante ne doit pas faire perdre la
+consommation mesurée de la même ligne). L'ordre d'appel n'est pas
+négociable : on qualifie d'abord, on neutralise ensuite, sinon toute
+mesure hors bornes ressemble à un cast en échec.
+
+**Normalisation UTC.** `date_heure` porte un offset ISO explicite. Trois
+cas : colonne déjà typée `timestamp` (Spark a lu l'offset, ne pas
+reconvertir), texte avec offset, texte sans offset (interprété en
+Europe/Paris). `ts_local` est conservée pour les features calendaires du
+ML : la consommation suit le rythme humain, pas UTC.
+
+**Déduplication par qualité.** Le même quart d'heure est publié en temps
+réel, puis remplacé par du consolidé, puis par du définitif. La qualité
+est lue **dans** la donnée (champ `nature`), pas déduite du chemin Bronze :
+un lot mensuel peut être à cheval sur la frontière consolidé/définitif.
+
+Sur `grid_load` la fusion se fait **mesure par mesure** et pas ligne par
+ligne, parce que les deux flux sont complémentaires : le définitif ne
+publie les mesures qu'au pas de 30 min alors que les prévisions sont au
+quart d'heure. Garder bêtement la ligne consolidée perdrait la mesure
+temps réel du même horodatage.
+
+**Dépivotement des filières.** Une colonne par filière devient une ligne
+par filière : le schéma absorbe une nouvelle filière sans changer. Chaque
+ligne porte sa place dans la hiérarchie. Seuls les **agrégats** sont émis
+par défaut, parce que `eolien` vaut déjà `eolien_terrestre +
+eolien_offshore` : émettre les trois ferait double compte dès que Gold
+somme la production totale. Les filières de détail sont déclarées dans le
+mapping et s'activent avec `unpivot.include_levels`.
+
+### Trois écarts que le mapping rend visibles
+
+Relevés sur les API, pas sur une doc — c'est tout l'objet de
+`scripts/explore_schema.py` :
+
+| Constat | Conséquence |
+|---|---|
+| Temps réel : 41 champs. Consolidé : 37. `eolien_offshore` et `stockage_batterie` n'existent que d'un côté | Un champ absent est signalé puis mis à null, jamais fatal |
+| `ech_comm_allemagne_belgique` arrive en entier d'un flux, en chaîne de l'autre | Typage explicite obligatoire ; un cast raté part en quarantaine au lieu de devenir un null muet |
+| Open‑Meteo publie le vent en **km/h**, pas en m/s | Facteur de conversion déclaré dans le mapping, et l'unité annoncée par l'API (`hourly_units`) est vérifiée à chaque run. Une colonne `wind_speed_ms` qui contient des km/h ment de 3,6× et personne ne s'en aperçoit avant d'entraîner un modèle dessus |
+
+Le fuseau d'Open‑Meteo est vérifié sur `utc_offset_seconds` et non sur le
+libellé : l'API répond `GMT` quand on demande `UTC`.
+
+Vérification sans cluster :
+
+```bash
+python scripts/test_silver_local.py
+```
+
+Le script fabrique un Bronze factice respectant l'arborescence réelle et
+rejoue 33 contrôles : lecture des trois formats, conversion UTC dont la
+nuit du changement d'heure, les quatre motifs de rejet, la fusion par
+qualité, le dépivotement sans double compte, la conversion d'unités et
+l'idempotence du rejeu.
+
+---
+
 ## Idempotence
 
 L'exigence « un DAG interrompu doit pouvoir être relancé sans dupliquer les
@@ -155,6 +236,7 @@ descendre l'intervalle sous 60 s ferait dépasser le quota. Le code gère le
 
 ```
 conf/sources.yml              sources, zones, chemins — aucune URL en dur ailleurs
+conf/silver_mapping.yml       champs source → modèle commun, filières, bornes
 src/common/config.py          chargement conf + construction des chemins (Layout)
 src/common/hdfs_io.py         BronzeWriter : écriture atomique + _SUCCESS
 src/ingestion/
@@ -163,15 +245,23 @@ src/ingestion/
   batch_eco2mix_cons.py       CSV mensuel → Bronze
   batch_open_meteo.py         JSON par ville × mois → Bronze
   batch_entsoe.py             XML mensuel → Bronze (optionnel)
+src/silver/
+  mapping.py                  lecture du mapping, résolution des noms de champs
+  readers.py                  lecture Bronze : csv, json_envelope, json_arrays
+  validation.py               contrôles de schéma + quarantaine _rejects
+  transform.py                UTC, qualité, dédup, dépivotement, écriture
+  silver_grid.py              eco2mix → grid_load + grid_generation
+  silver_weather.py           Open-Meteo → weather
 scripts/
   explore_schema.py           découverte des schémas réels
   test_idempotence.py         scénarios d'idempotence sans cluster
+  test_silver_local.py        31 contrôles Silver sans HDFS ni cluster
 ```
 
 ## Reste à faire
 
-- [ ] `conf/silver_mapping.yml` — mapping champs source → modèle commun
-- [ ] `src/silver/` — validation de schéma, dédup, normalisation UTC, dépivotement des filières
+- [x] `conf/silver_mapping.yml` — mapping champs source → modèle commun
+- [x] `src/silver/` — validation de schéma, dédup, normalisation UTC, dépivotement des filières
 - [ ] `src/gold/` — `mix_horaire`, `kpi_daily`, `ml_features`
 - [ ] `dags/` — DAGs Airflow avec dépendances par Datasets
 - [ ] `notebooks/` — restitution Pandas depuis Gold

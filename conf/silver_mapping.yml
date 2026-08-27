@@ -1,0 +1,462 @@
+# ---------------------------------------------------------------------------
+# Mapping Silver : champs source -> modele commun.
+#
+# Ce fichier est le CONTRAT de la couche Silver. Le code de src/silver/ ne
+# contient aucun nom de champ source en dur : il lit ce mapping. Quand RTE
+# ajoute une filiere ou renomme une colonne, on edite ce YAML, pas le Python.
+#
+# Les noms de champs ont ete releves sur les API, pas sur une doc :
+#   python scripts/explore_schema.py --all --out conf/schema_discovered.json
+#
+# Ecarts constates entre les deux flux eco2mix, et qui justifient a eux seuls
+# l'existence de ce fichier :
+#   - temps reel : 41 champs, dont eolien_terrestre, eolien_offshore,
+#                  stockage_batterie, destockage_batterie
+#   - consolide  : 37 champs, ces quatre-la sont absents
+#   - ech_comm_allemagne_belgique arrive en entier d'un cote, en chaine de
+#     l'autre : le typage doit etre explicite, jamais infere
+#   - le consolide ne publie les mesures qu'au pas de 30 min, alors que les
+#     previsions sont au quart d'heure : une ligne sur deux n'a que des
+#     previsions. Ce n'est pas une anomalie, c'est le format.
+#
+# Conventions de comparaison des noms : la resolution est insensible a la
+# casse, aux accents et a la ponctuation (voir normalize() dans mapping.py).
+# "Date et heure", "date_heure" et "DATE-HEURE" designent donc le meme champ.
+# ---------------------------------------------------------------------------
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Qualite : ce qui arbitre la deduplication.
+#
+# eco2mix publie le meme quart d'heure plusieurs fois, d'abord en temps reel
+# puis en consolide puis en definitif. Le champ `nature` porte cette
+# information DANS la donnee : on la lit plutot que de la deduire du chemin
+# du fichier, parce qu'un lot batch peut contenir les deux natures a cheval
+# sur la frontiere consolide / definitif.
+# ---------------------------------------------------------------------------
+quality:
+  field_candidates: ["nature", "qualite", "quality"]
+  # Rang croissant = priorite decroissante. 0 gagne toujours.
+  ranks:
+    definitive: 0
+    consolidated: 1
+    realtime: 2
+    unknown: 9
+  # Cle normalisee (sans accent, minuscule) -> niveau de qualite.
+  values:
+    "donnees definitives": definitive
+    "definitives": definitive
+    "donnees consolidees": consolidated
+    "consolidees": consolidated
+    "donnees temps reel": realtime
+    "temps reel": realtime
+    # Valeurs deja normalisees, utiles quand la source les fournit telles quelles.
+    "definitive": definitive
+    "consolidated": consolidated
+    "realtime": realtime
+
+# ---------------------------------------------------------------------------
+# Temps : la normalisation UTC.
+#
+# date_heure d'eco2mix porte un offset ISO explicite (+00:00 sur les exports
+# actuels). Trois cas geres par normalize_time() :
+#   1. la colonne est deja de type timestamp -> Spark a lu l'offset, c'est
+#      de l'UTC, ne PAS reconvertir sous peine de decaler d'une heure
+#   2. chaine avec offset -> to_timestamp suffit
+#   3. chaine sans offset -> interpreter dans `fallback_timezone`
+# Le cas 3 est ambigu la nuit du passage a l'heure d'hiver (02:00 locale
+# existe deux fois) : on le journalise au lieu de le masquer.
+# ---------------------------------------------------------------------------
+time:
+  candidates: ["date_heure", "date_et_heure", "datetime", "date_time", "horodate"]
+  fallback_timezone: "Europe/Paris"
+  local_timezone: "Europe/Paris"
+  # Conserve pour les features calendaires du ML : la consommation suit le
+  # rythme humain, pas UTC.
+  emit_local: true
+
+# ---------------------------------------------------------------------------
+# Colonnes communes a toutes les tables Silver.
+# ---------------------------------------------------------------------------
+lineage_columns:
+  - ts_utc          # cle temporelle commune aux trois sources
+  - ts_local
+  - zone_id         # cle de jointure commune (cf. conf/sources.yml : zones)
+  - source          # nom logique de la source Bronze
+  - quality         # definitive | consolidated | realtime
+  - quality_rank    # materialise : evite de refaire le mapping en Gold
+  - ingested_at
+  - source_file
+
+partitioning:
+  # Date METIER, pas date d'ingestion : c'est ce qui rend le rejeu idempotent.
+  columns: ["year", "month"]
+  derived_from: "ts_utc"
+
+# ---------------------------------------------------------------------------
+# TABLES DU MODELE COMMUN
+# ---------------------------------------------------------------------------
+tables:
+
+  # -- Consommation nationale ---------------------------------------------
+  grid_load:
+    description: "Consommation, previsions RTE et intensite carbone au pas source."
+    zone_id: "fr"
+    keys: ["ts_utc", "zone_id"]
+    # merge : pour chaque mesure on retient la valeur non nulle de meilleure
+    # qualite. Les deux flux sont complementaires (le consolide n'a pas
+    # toujours la consommation la ou le temps reel l'a) : garder betement la
+    # ligne consolidee perdrait de la donnee.
+    dedup_strategy: merge
+    measures:
+      consumption_mw:
+        from: ["consommation", "consommation_mw", "conso"]
+        type: double
+        unit: MW
+        # La France ne consomme ni 0 ni 200 GW. Hors bornes -> quarantaine,
+        # jamais un filtre silencieux.
+        min: 10000
+        max: 120000
+        on_range_violation: reject
+      forecast_j1_mw:
+        from: ["prevision_j1", "prevision_j_1", "previsionj1"]
+        type: double
+        unit: MW
+        min: 10000
+        max: 120000
+        on_range_violation: null_out
+      forecast_j_mw:
+        from: ["prevision_j", "previsionj"]
+        type: double
+        unit: MW
+        min: 10000
+        max: 120000
+        on_range_violation: null_out
+      co2_rate_g_kwh:
+        from: ["taux_co2", "taux_de_co2", "co2"]
+        type: double
+        unit: gCO2/kWh
+        min: 0
+        max: 1200
+        on_range_violation: null_out
+      physical_exchange_mw:
+        # Solde des echanges physiques aux frontieres. Negatif = export.
+        from: ["ech_physiques", "echanges_physiques"]
+        type: double
+        unit: MW
+        min: -25000
+        max: 25000
+        on_range_violation: null_out
+    dimensions:
+      perimeter:
+        from: ["perimetre"]
+        type: string
+        # Le dataset national ne doit contenir que la France. Une ligne
+        # regionale ici signalerait un melange de datasets en Bronze.
+        expect_values: ["France"]
+        on_violation: reject
+    validation:
+      # Une ligne sans horodatage n'a aucune cle de jointure : elle est
+      # inexploitable, on la quarantaine.
+      not_null: ["ts_utc"]
+      # Une ligne qui n'a AUCUNE mesure n'est pas une erreur (cf. le pas de
+      # 30 min du consolide) mais elle ne merite pas d'etre ecrite.
+      drop_if_all_null: ["consumption_mw", "forecast_j1_mw", "forecast_j_mw",
+                         "co2_rate_g_kwh", "physical_exchange_mw"]
+
+  # -- Production par filiere (table depivotee) ----------------------------
+  grid_generation:
+    description: "Une ligne par (horodatage, zone, filiere). Absorbe une
+                  nouvelle filiere sans changement de schema."
+    zone_id: "fr"
+    keys: ["ts_utc", "zone_id", "filiere"]
+    # priority : une ligne de filiere est atomique, il n'y a rien a fusionner.
+    dedup_strategy: priority
+    unpivot:
+      value_column: generation_mw
+      name_column: filiere
+      unit: MW
+      # Ce que l'on ecrit reellement. Les filieres `detail` sont declarees
+      # plus bas mais exclues par defaut : eolien = eolien_terrestre +
+      # eolien_offshore, les emettre toutes ferait double compte des que
+      # Gold somme la production totale.
+      include_levels: ["aggregate"]
+      include_categories: ["production", "stockage"]
+      # Bornes larges : le nucleaire francais plafonne vers 60 GW, le
+      # pompage et le stockage batterie sont legitimement negatifs.
+      min: -20000
+      max: 80000
+      on_range_violation: reject
+      drop_null_values: true
+    validation:
+      not_null: ["ts_utc", "filiere"]
+
+  # -- Meteo horaire -------------------------------------------------------
+  weather:
+    description: "Archive Open-Meteo par ville + agregat national pondere."
+    keys: ["ts_utc", "zone_id"]
+    dedup_strategy: priority
+    measures:
+      temperature_c:
+        from: ["temperature_2m", "temperature"]
+        type: double
+        unit: "degC"
+        source_unit: "°C"
+        min: -50
+        max: 55
+        on_range_violation: reject
+      humidity_pct:
+        from: ["relative_humidity_2m", "humidity"]
+        type: double
+        unit: "%"
+        source_unit: "%"
+        min: 0
+        max: 100
+        on_range_violation: null_out
+      wind_speed_ms:
+        from: ["wind_speed_10m", "windspeed_10m"]
+        type: double
+        unit: "m/s"
+        # PIEGE : Open-Meteo renvoie des km/h par defaut, pas des m/s.
+        # Le facteur est declare ici et l'unite reellement annoncee par
+        # l'API (hourly_units) est verifiee a l'execution : si elle change,
+        # le job avertit au lieu de produire des valeurs 3,6 fois trop
+        # grandes sous un nom de colonne qui ment.
+        source_unit: "km/h"
+        factor: 0.2777777777777778
+        min: 0
+        max: 60
+        on_range_violation: null_out
+      cloud_cover_pct:
+        from: ["cloud_cover", "cloudcover"]
+        type: double
+        unit: "%"
+        source_unit: "%"
+        min: 0
+        max: 100
+        on_range_violation: null_out
+    validation:
+      not_null: ["ts_utc", "zone_id"]
+      drop_if_all_null: ["temperature_c", "humidity_pct", "wind_speed_ms",
+                         "cloud_cover_pct"]
+
+# ---------------------------------------------------------------------------
+# SOURCES BRONZE
+# Comment atteindre les champs, source par source.
+# ---------------------------------------------------------------------------
+sources:
+
+  eco2mix_cons:
+    bronze: "bronze/eco2mix_cons"
+    format: csv
+    csv:
+      header: true
+      sep: ";"
+      # Les colonnes varient selon les annees : on infere pour lire, puis on
+      # retype explicitement d'apres `type` ci-dessus. L'inference sert a
+      # lire, jamais a definir le schema Silver.
+      infer_schema: true
+    glob: "year=*/month=*/*.csv"
+    default_quality: consolidated
+    feeds: ["grid_load", "grid_generation"]
+    required_fields: ["date_heure", "consommation"]
+
+  eco2mix_tr:
+    bronze: "bronze/eco2mix_tr"
+    format: json_envelope
+    # Le streaming stocke la valeur Kafka brute : le payload est sous
+    # raw_value, encapsule par le producteur dans {_meta, payload}.
+    envelope:
+      raw_column: "raw_value"
+      payload_path: "payload"
+      meta_path: "_meta"
+      ingested_at_column: "bronze_ingested_at"
+      sample_size: 1000
+    glob: "ingest_date=*/ingest_hour=*/*"
+    default_quality: realtime
+    feeds: ["grid_load", "grid_generation"]
+    required_fields: ["date_heure"]
+
+  meteo_archive:
+    bronze: "bronze/meteo_archive"
+    format: json_arrays
+    # Tableaux paralleles : hourly.time[i] correspond a
+    # hourly.temperature_2m[i]. arrays_zip + explode pour passer en lignes.
+    arrays:
+      container: "hourly"
+      index_field: "time"
+      units_container: "hourly_units"
+    # basePath : Spark remonte city= du chemin en colonne.
+    glob: "city=*/year=*/month=*/*.json"
+    partition_column: "city"
+    zone_from_partition: true
+    default_quality: consolidated
+    feeds: ["weather"]
+    validation:
+      # L'archive est demandee en UTC. Open-Meteo repond "GMT" et non "UTC" :
+      # c'est utc_offset_seconds qui fait foi, pas le libelle.
+      expect_utc_offset_seconds: 0
+      timezone_labels: ["UTC", "GMT", "Etc/UTC", "Etc/GMT"]
+
+# ---------------------------------------------------------------------------
+# FILIERES DE PRODUCTION
+#
+# `level` : aggregate = filiere telle que publiee au premier niveau
+#           detail    = decomposition technologique de la precedente
+#           Emettre les deux sans distinction ferait double compte.
+# `category` : production | stockage. Le stockage est signe (pompage et
+#           charge batterie sont negatifs), il ne se somme pas comme de la
+#           production.
+# `renewable` : alimente is_renewable, utilise par gold/kpi_daily.
+#
+# Filieres relevees sur l'API le 2026-08-27. Une filiere declaree ici mais
+# absente des donnees est simplement ignoree, avec un avertissement.
+# ---------------------------------------------------------------------------
+filieres:
+
+  # -- Aggregats : ce qui est ecrit en Silver par defaut -------------------
+  - name: nucleaire
+    level: aggregate
+    category: production
+    renewable: false
+  - name: thermique
+    level: aggregate
+    category: production
+    renewable: false
+    note: "absente des flux nationaux actuels, conservee pour les archives"
+  - name: charbon
+    level: aggregate
+    category: production
+    renewable: false
+  - name: fioul
+    level: aggregate
+    category: production
+    renewable: false
+  - name: gaz
+    level: aggregate
+    category: production
+    renewable: false
+  - name: eolien
+    level: aggregate
+    category: production
+    renewable: true
+  - name: solaire
+    level: aggregate
+    category: production
+    renewable: true
+  - name: hydraulique
+    level: aggregate
+    category: production
+    renewable: true
+  - name: bioenergies
+    level: aggregate
+    category: production
+    renewable: true
+  - name: pompage
+    level: aggregate
+    category: stockage
+    renewable: false
+    note: "negatif : consommation des STEP en pompage"
+  - name: stockage_batterie
+    level: aggregate
+    category: stockage
+    renewable: false
+    note: "negatif : charge des batteries"
+  - name: destockage_batterie
+    level: aggregate
+    category: stockage
+    renewable: false
+
+  # -- Details : presents en temps reel, absents du consolide --------------
+  - name: eolien_terrestre
+    level: detail
+    parent: eolien
+    category: production
+    renewable: true
+  - name: eolien_offshore
+    level: detail
+    parent: eolien
+    category: production
+    renewable: true
+  - name: fioul_tac
+    level: detail
+    parent: fioul
+    category: production
+    renewable: false
+  - name: fioul_cogen
+    level: detail
+    parent: fioul
+    category: production
+    renewable: false
+  - name: fioul_autres
+    level: detail
+    parent: fioul
+    category: production
+    renewable: false
+  - name: gaz_tac
+    level: detail
+    parent: gaz
+    category: production
+    renewable: false
+  - name: gaz_cogen
+    level: detail
+    parent: gaz
+    category: production
+    renewable: false
+  - name: gaz_ccg
+    level: detail
+    parent: gaz
+    category: production
+    renewable: false
+  - name: gaz_autres
+    level: detail
+    parent: gaz
+    category: production
+    renewable: false
+  - name: hydraulique_fil_eau_eclusee
+    level: detail
+    parent: hydraulique
+    category: production
+    renewable: true
+  - name: hydraulique_lacs
+    level: detail
+    parent: hydraulique
+    category: production
+    renewable: true
+  - name: hydraulique_step_turbinage
+    level: detail
+    parent: hydraulique
+    category: production
+    renewable: true
+  - name: bioenergies_dechets
+    level: detail
+    parent: bioenergies
+    category: production
+    renewable: true
+  - name: bioenergies_biomasse
+    level: detail
+    parent: bioenergies
+    category: production
+    renewable: true
+  - name: bioenergies_biogaz
+    level: detail
+    parent: bioenergies
+    category: production
+    renewable: true
+
+# ---------------------------------------------------------------------------
+# QUARANTAINE
+# Une ligne invalide n'est jamais perdue silencieusement : elle part dans
+# /datalake/silver/_rejects/<table>/ avec son motif et sa charge utile.
+# Partitionnement par fenetre de traitement : rejouer la meme fenetre
+# reecrit exactement la meme partition de rejets (idempotence), rejouer une
+# autre fenetre ne l'ecrase pas.
+# ---------------------------------------------------------------------------
+rejects:
+  enabled: true
+  format: parquet
+  partition_column: "run_window"
+  # Au-dela, on considere que ce n'est plus une anomalie de donnee mais un
+  # probleme de mapping : le job echoue au lieu de vider la table.
+  max_reject_ratio: 0.25

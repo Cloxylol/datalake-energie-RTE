@@ -2,22 +2,27 @@
 """
 Silver : Bronze eco2mix (CSV batch + JSON streaming) -> grid_load + grid_generation.
 
-Trois regles font le travail :
+Quatre regles font tout le travail, et toutes sont pilotees par
+conf/silver_mapping.yml plutot que codees en dur ici :
 
-1. NORMALISATION TEMPORELLE. eco2mix publie en heure locale francaise avec
-   offset ISO. On convertit en UTC et on garde ts_local pour les features
-   calendaires du ML.
+1. VALIDATION DE SCHEMA. Champs structurants controles avant lecture,
+   typage explicite, bornes metier. Une ligne fautive part en quarantaine
+   dans /datalake/silver/_rejects/, jamais a la poubelle.
 
-2. DEDUPLICATION AVEC PRIORITE DE QUALITE. Le temps reel est publie tout de
-   suite puis remplace par du consolide. Cle (ts_utc, zone_id), le consolide
-   gagne toujours. C'est ce qui justifie d'avoir garde les deux flux.
+2. NORMALISATION TEMPORELLE. date_heure porte un offset ISO ; on le lit et
+   on produit ts_utc, plus ts_local pour les features calendaires du ML.
 
-3. DEPIVOTEMENT DES FILIERES. eco2mix livre une colonne par filiere. On passe
-   en lignes : le schema absorbe une nouvelle filiere sans changer.
+3. DEDUPLICATION AVEC PRIORITE DE QUALITE. Le meme quart d'heure est publie
+   en temps reel puis remplace par du consolide puis par du definitif. La
+   qualite est lue dans le champ `nature`, pas deduite du chemin Bronze.
+   Sur grid_load la fusion se fait mesure par mesure : les deux flux sont
+   complementaires, le consolide ne publie les mesures qu'au pas de 30 min
+   la ou le temps reel les a au quart d'heure.
 
-TOLERANCE AUX NOMS DE CHAMPS : les colonnes reellement presentes sont
-detectees a l'execution par intersection avec une liste de candidats. Un
-champ absent est ignore avec un avertissement, il ne fait pas tomber le job.
+4. DEPIVOTEMENT DES FILIERES. Une colonne par filiere -> une ligne par
+   filiere. Le schema absorbe une nouvelle filiere sans changer. Seuls les
+   aggregats sont emis : eolien vaut deja eolien_terrestre +
+   eolien_offshore, emettre les trois ferait double compte en Gold.
 
     spark-submit silver_grid.py --start 2024-03-01 --end 2024-03-31
 """
@@ -25,243 +30,168 @@ champ absent est ignore avec un avertissement, il ne fait pas tomber le job.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+from dataclasses import dataclass
+from functools import reduce
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql import types as T
 
 sys.path.insert(0, "/opt/datalake/src")
+
 from common.config import Layout, load_config  # noqa: E402
+from silver.mapping import SilverMapping, load_mapping  # noqa: E402
+from silver.readers import read_source  # noqa: E402
+from silver.transform import (  # noqa: E402
+    add_partitions, dedupe, normalize_time, derive_quality, restrict_window,
+    unpivot_filieres, write_silver,
+)
+from silver.validation import (  # noqa: E402
+    SchemaValidator, ValidationError, ValidationReport, write_rejects,
+)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)-7s [silver-grid] %(message)s")
 log = logging.getLogger(__name__)
 
-# Candidats : on prend ce qui existe reellement dans les donnees.
-TIME_CANDIDATES = ["date_heure", "date_et_heure", "datetime", "date"]
-LOAD_CANDIDATES = {
-    "consumption_mw": ["consommation", "consommation_mw", "conso"],
-    "forecast_j1_mw": ["prevision_j1", "prevision_j_1", "previsionj1"],
-    "forecast_j_mw": ["prevision_j", "previsionj"],
-    "co2_rate_g_kwh": ["taux_co2", "taux_de_co2", "co2"],
-}
-# Filieres de production. Renouvelable = True/False.
-FILIERES = {
-    "nucleaire": False, "thermique": False, "charbon": False, "fioul": False,
-    "gaz": False, "eolien": True, "eolien_terrestre": True,
-    "eolien_offshore": True, "solaire": True, "hydraulique": True,
-    "bioenergies": True, "pompage": False, "stockage_batterie": False,
-    "destockage_batterie": False,
-}
+GRID_SOURCES = ("eco2mix_cons", "eco2mix_tr")
 
 
-def pick(cols: list[str], candidates: list[str]) -> str | None:
-    """Premier candidat present dans les colonnes, insensible a la casse."""
-    lower = {c.lower(): c for c in cols}
-    for cand in candidates:
-        if cand in lower:
-            return lower[cand]
-    return None
+@dataclass
+class SilverResult:
+    """Ce que produit une etape Silver : la table, sa quarantaine, son bilan."""
+
+    df: DataFrame
+    rejects: DataFrame
+    report: ValidationReport
 
 
 # ---------------------------------------------------------------------------
-# Lecture Bronze
+# Preparation commune aux deux tables
 # ---------------------------------------------------------------------------
 
-def read_bronze_batch(spark: SparkSession, layout: Layout, fs: str,
-                      start: str, end: str) -> DataFrame | None:
-    """CSV consolide. inferSchema volontairement actif ici : les colonnes
-    varient selon les annees, et on retype explicitement juste apres."""
-    path = f"{fs}{layout.root}/bronze/eco2mix_cons"
-    try:
-        df = (spark.read
-              .option("header", True)
-              .option("sep", ";")
-              .option("inferSchema", True)
-              .option("mode", "PERMISSIVE")
-              .csv(f"{path}/year=*/month=*/*.csv"))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Aucun lot batch lisible : %s", exc)
-        return None
+def prepare(df: DataFrame, mapping: SilverMapping, source: str,
+            zone_id: str = "fr") -> DataFrame:
+    """Horodatage UTC, qualite, colonnes de tracabilite.
 
-    if not df.columns:
-        return None
-    log.info("Bronze batch : %d colonnes detectees.", len(df.columns))
-    return df.withColumn("_quality", F.lit("consolidated")) \
-             .withColumn("_source", F.lit("eco2mix_cons"))
-
-
-def read_bronze_stream(spark: SparkSession, layout: Layout, fs: str) -> DataFrame | None:
-    """JSON produit par Structured Streaming. Le payload est encapsule dans
-    raw_value : on le parse ici, pas en Bronze."""
-    path = f"{fs}{layout.bronze_stream('eco2mix_tr')}"
-    try:
-        raw = spark.read.json(f"{path}/ingest_date=*/ingest_hour=*/*")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Aucun lot streaming lisible : %s", exc)
-        return None
-
-    if "raw_value" not in raw.columns:
-        log.warning("Colonne raw_value absente du Bronze streaming.")
-        return None
-
-    # Le schema du payload est decouvert sur un echantillon.
-    sample = raw.select("raw_value").limit(1000)
-    inferred = spark.read.json(sample.rdd.map(lambda r: r.raw_value)).schema
-
-    parsed = (raw
-              .withColumn("j", F.from_json("raw_value", inferred))
-              .select("j.payload.*", F.col("bronze_ingested_at"))
-              .withColumn("_quality", F.lit("realtime"))
-              .withColumn("_source", F.lit("eco2mix_tr")))
-    log.info("Bronze streaming : %d colonnes.", len(parsed.columns))
-    return parsed
-
-
-# ---------------------------------------------------------------------------
-# Normalisation
-# ---------------------------------------------------------------------------
-
-def normalize_time(df: DataFrame) -> DataFrame:
-    """ts_utc + ts_local.
-
-    PIEGE : si la colonne source est deja de type timestamp (inferSchema a
-    fait son travail, ou le JSON etait type), Spark l'a DEJA ramenee en UTC
-    en interpretant l'offset ISO. Reappliquer to_utc_timestamp decalerait
-    tout d'une heure supplementaire. On teste donc le TYPE de la colonne,
-    pas seulement son contenu.
-
-    Trois cas :
-      1. deja timestamp        -> rien a faire, c'est de l'UTC
-      2. string avec offset    -> to_timestamp suffit, l'offset est lu
-      3. string sans offset    -> interpreter en Europe/Paris
-
-    Le cas 3 est celui du changement d'heure : 02:00 locale existe deux fois
-    le dernier dimanche d'octobre. Sans offset l'information est perdue et
-    Spark choisit une des deux, ce qui ecrase un quart d'heure. On le
-    signale plutot que de le masquer.
+    ingested_at reprend l'instant d'ingestion Bronze quand il existe
+    (colonne technique posee par le job streaming) : c'est lui qui
+    departage deux lignes de meme qualite, et il doit rester stable d'un
+    rejeu a l'autre.
     """
-    tcol = pick(df.columns, TIME_CANDIDATES)
-    if tcol is None:
-        raise ValueError(
-            f"Aucune colonne temporelle trouvee parmi {TIME_CANDIDATES}. "
-            f"Colonnes disponibles : {df.columns[:20]}"
-        )
+    spec = mapping.source(source)
+    out = normalize_time(df, mapping)
+    out = derive_quality(out, mapping, spec.default_quality)
 
-    dtype = dict(df.dtypes)[tcol]
-    log.info("Colonne temporelle : %s (type %s)", tcol, dtype)
-
-    if dtype.startswith("timestamp"):
-        # Cas 1 : Spark a deja lu l'offset. Ne surtout pas reconvertir.
-        ts_utc = F.col(tcol)
-    else:
-        as_str = F.col(tcol).cast("string")
-        has_offset = as_str.rlike(r"([+-]\d{2}:?\d{2}|Z)$")
-        ts_utc = F.when(has_offset, F.to_timestamp(as_str)) \
-                  .otherwise(F.to_utc_timestamp(F.to_timestamp(as_str),
-                                                "Europe/Paris"))
-        log.info("Colonne texte : conversion de fuseau appliquee si besoin.")
-
-    return (df
-            .withColumn("ts_utc", ts_utc)
-            .filter(F.col("ts_utc").isNotNull())
-            .withColumn("ts_local", F.from_utc_timestamp("ts_utc", "Europe/Paris")))
-
-
-def build_grid_load(df: DataFrame) -> DataFrame:
-    """Table de consommation, colonnes communes + mesures."""
-    out = df
-    for target, cands in LOAD_CANDIDATES.items():
-        src = pick(df.columns, cands)
-        if src:
-            out = out.withColumn(target, F.col(src).cast(T.DoubleType()))
-        else:
-            log.warning("Champ %s introuvable (candidats %s), mis a null.",
-                        target, cands)
-            out = out.withColumn(target, F.lit(None).cast(T.DoubleType()))
+    ingested = (F.col("bronze_ingested_at").cast("timestamp")
+                if "bronze_ingested_at" in df.columns
+                else F.lit(None).cast("timestamp"))
 
     return (out
-            .withColumn("zone_id", F.lit("fr"))
-            .withColumn("source", F.col("_source"))
-            .withColumn("quality", F.col("_quality"))
-            .withColumn("ingested_at", F.current_timestamp())
-            .withColumn("source_file", F.input_file_name())
-            .select("ts_utc", "ts_local", "zone_id", "source", "quality",
-                    "ingested_at", "source_file",
-                    *LOAD_CANDIDATES.keys())
-            # Garde-fou metier : la France ne consomme ni 0 ni 200 GW.
-            .filter((F.col("consumption_mw").isNull()) |
-                    ((F.col("consumption_mw") > 10000) &
-                     (F.col("consumption_mw") < 120000))))
+            .withColumn("zone_id", F.lit(zone_id))
+            .withColumn("source", F.lit(source))
+            .withColumn("ingested_at",
+                        F.coalesce(ingested, F.current_timestamp()))
+            .withColumn("source_file",
+                        F.col("source_file") if "source_file" in df.columns
+                        else F.lit("")))
 
 
-def build_grid_generation(df: DataFrame) -> DataFrame:
-    """Depivotement : une colonne par filiere -> une ligne par filiere."""
-    present = [f for f in FILIERES if pick(df.columns, [f])]
-    if not present:
-        raise ValueError(
-            f"Aucune filiere trouvee. Colonnes : {df.columns[:30]}"
-        )
-    log.info("%d filiere(s) detectee(s) : %s", len(present), ", ".join(present))
+# ---------------------------------------------------------------------------
+# grid_load
+# ---------------------------------------------------------------------------
 
-    # stack(n, 'a', a, 'b', b, ...) : le depivotement natif Spark.
-    pairs = ", ".join(
-        f"'{f}', CAST(`{pick(df.columns, [f])}` AS DOUBLE)" for f in present
-    )
-    expr = f"stack({len(present)}, {pairs}) as (filiere, generation_mw)"
+def build_grid_load(df: DataFrame, mapping: SilverMapping | None = None,
+                    source: str = "eco2mix_cons") -> SilverResult:
+    """Table de consommation : mesures typees, bornees, tracees."""
+    mapping = mapping or load_mapping()
+    spec = mapping.table("grid_load")
+    validator = SchemaValidator(mapping, "grid_load", source)
 
-    renew = F.create_map(*[x for f in present
-                           for x in (F.lit(f), F.lit(FILIERES[f]))])
+    payload_columns = df.columns
+    out = validator.cast_measures(df)
+    out = validator.cast_dimensions(out)
 
-    return (df
-            .select("ts_utc", "ts_local", "_source", "_quality",
-                    F.expr(expr))
-            .filter(F.col("generation_mw").isNotNull())
-            .withColumn("zone_id", F.lit("fr"))
-            .withColumn("source", F.col("_source"))
-            .withColumn("quality", F.col("_quality"))
-            .withColumn("is_renewable", renew[F.col("filiere")])
-            .withColumn("ingested_at", F.current_timestamp())
-            .withColumn("source_file", F.lit(""))
-            .select("ts_utc", "ts_local", "zone_id", "filiere", "generation_mw",
-                    "is_renewable", "source", "quality", "ingested_at",
-                    "source_file"))
+    # L'ORDRE COMPTE. La detection passe avant la neutralisation : une
+    # mesure mise a null parce qu'elle est hors bornes ressemble trait pour
+    # trait a un cast qui a echoue, et serait comptee comme telle. On
+    # qualifie d'abord, on neutralise ensuite, sur les seules lignes gardees.
+    valid, rejects = validator.split(out, payload_columns)
+    valid = validator.null_out_of_range(valid)
+    valid = validator.drop_empty_rows(valid)
+
+    columns = [c for c in mapping.lineage_columns if c in valid.columns]
+    valid = valid.select(*columns, *spec.measures.keys())
+
+    validator.enforce_ratio()
+    return SilverResult(valid, rejects, validator.report)
 
 
-def dedupe(df: DataFrame, keys: list[str]) -> DataFrame:
-    """Dedup avec priorite : consolide > temps reel, puis ingestion la plus
-    recente. C'est la regle qui fait que le temps reel se fait ecraser des
-    que sa version consolidee arrive."""
-    from pyspark.sql import Window
+# ---------------------------------------------------------------------------
+# grid_generation
+# ---------------------------------------------------------------------------
 
-    w = (Window.partitionBy(*keys)
-         .orderBy(F.when(F.col("quality") == "consolidated", 0).otherwise(1),
-                  F.col("ingested_at").desc()))
-    return (df.withColumn("_rn", F.row_number().over(w))
-              .filter(F.col("_rn") == 1)
-              .drop("_rn"))
+def build_grid_generation(df: DataFrame, mapping: SilverMapping | None = None,
+                          source: str = "eco2mix_cons") -> SilverResult:
+    """Depivotement des filieres, puis validation de la table longue.
+
+    L'ordre compte : les bornes de production s'appliquent a la valeur
+    depivotee, pas a la colonne large. Une seule filiere aberrante ne doit
+    pas emporter les onze autres du meme horodatage.
+    """
+    mapping = mapping or load_mapping()
+    spec = mapping.table("grid_generation")
+
+    long_df, present, missing = unpivot_filieres(df, mapping)
+
+    value_measure = spec.value_measure()
+    validator = SchemaValidator(mapping, "grid_generation", source,
+                                measures={value_measure.target: value_measure})
+    validator.report.present_filieres = present
+    validator.report.missing_filieres = missing
+
+    valid, rejects = validator.split(long_df, long_df.columns)
+    validator.report.n_valid = valid.count()
+
+    columns = [c for c in mapping.lineage_columns if c in valid.columns]
+    valid = valid.select(*columns, "filiere", "generation_mw", "is_renewable",
+                         "filiere_category", "filiere_level", "filiere_parent")
+
+    validator.enforce_ratio()
+    return SilverResult(valid, rejects, validator.report)
 
 
-def add_partitions(df: DataFrame) -> DataFrame:
-    return (df.withColumn("year", F.year("ts_utc"))
-              .withColumn("month", F.month("ts_utc")))
+# ---------------------------------------------------------------------------
+# Job
+# ---------------------------------------------------------------------------
 
+def process_source(spark: SparkSession, mapping: SilverMapping, source: str,
+                   fs: str, root: str, start: str, end: str
+                   ) -> tuple[SilverResult | None, SilverResult | None]:
+    """Lit une source Bronze et en tire les deux tables."""
+    raw = read_source(spark, mapping, source, fs, root)
+    if raw is None:
+        return None, None
 
-def write_silver(df: DataFrame, path: str, label: str) -> int:
-    """Ecrasement dynamique : seules les partitions presentes dans df sont
-    remplacees. Sans dynamic, overwrite detruirait toute la table."""
-    n = df.count()
-    if n == 0:
-        log.warning("%s : 0 ligne, ecriture ignoree.", label)
-        return 0
-    (df.repartition("year", "month")
-       .write.mode("overwrite")
-       .partitionBy("year", "month")
-       .parquet(path))
-    log.info("%s : %d ligne(s) ecrite(s) dans %s", label, n, path)
-    return n
+    prepared = prepare(raw, mapping, source)
+    # keep_null : une ligne sans horodatage doit atteindre la quarantaine.
+    # La filtrer ici la ferait disparaitre sans laisser de trace, ce qui est
+    # exactement ce que la couche Silver est censee empecher.
+    prepared = restrict_window(prepared, start, end, keep_null=True).cache()
+
+    load = build_grid_load(prepared, mapping, source)
+    load.report.log_summary()
+
+    try:
+        gen = build_grid_generation(prepared, mapping, source)
+        gen.report.log_summary()
+    except ValueError as exc:
+        log.warning("Depivotement impossible sur %s : %s", source, exc)
+        gen = None
+
+    return load, gen
 
 
 def main() -> int:
@@ -269,11 +199,18 @@ def main() -> int:
     ap.add_argument("--start", required=True)
     ap.add_argument("--end", required=True)
     ap.add_argument("--conf", default=None)
+    ap.add_argument("--mapping", default=None,
+                    help="chemin de silver_mapping.yml")
+    ap.add_argument("--report", default=None,
+                    help="ecrit le bilan de validation en JSON")
     args = ap.parse_args()
 
     cfg = load_config(args.conf)
     layout = Layout(root=cfg["hdfs"]["root"])
     fs = cfg["hdfs"]["fs_uri"]
+    mapping = load_mapping(args.mapping)
+    log.info("Mapping Silver v%s : %d table(s), %d filiere(s) declaree(s).",
+             mapping.version, len(mapping.tables), len(mapping.filieres))
 
     spark = (SparkSession.builder.appName("silver-grid")
              .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
@@ -281,33 +218,63 @@ def main() -> int:
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
 
-    parts = [d for d in (read_bronze_batch(spark, layout, fs, args.start, args.end),
-                         read_bronze_stream(spark, layout, fs)) if d is not None]
-    if not parts:
-        log.error("Aucune donnee Bronze. Lancer l'ingestion d'abord.")
+    loads, gens, rejects, reports = [], [], [], []
+    for source in GRID_SOURCES:
+        try:
+            load, gen = process_source(spark, mapping, source, fs, layout.root,
+                                       args.start, args.end)
+        except ValidationError as exc:
+            log.error("Source %s invalide : %s", source, exc)
+            spark.stop()
+            return 1
+
+        for result, bucket in ((load, loads), (gen, gens)):
+            if result is not None:
+                bucket.append(result.df)
+                rejects.append(result.rejects)
+                reports.append(result.report.as_dict())
+
+    if not loads:
+        log.error("Aucune donnee Bronze exploitable. Lancer l'ingestion d'abord.")
+        spark.stop()
         return 1
 
-    loads, gens = [], []
-    for df in parts:
-        norm = normalize_time(df)
-        norm = norm.filter((F.col("ts_utc") >= F.lit(args.start)) &
-                           (F.col("ts_utc") < F.date_add(F.lit(args.end).cast("date"), 1)))
-        loads.append(build_grid_load(norm))
-        try:
-            gens.append(build_grid_generation(norm))
-        except ValueError as exc:
-            log.warning("Depivotement impossible sur une source : %s", exc)
+    window = f"{args.start}_{args.end}"
 
-    from functools import reduce
+    # -- grid_load : fusion mesure par mesure ------------------------------
+    spec_load = mapping.table("grid_load")
     load_df = reduce(DataFrame.unionByName, loads)
-    load_df = add_partitions(dedupe(load_df, ["ts_utc", "zone_id"]))
-    write_silver(load_df, f"{fs}{layout.silver('grid_load')}", "grid_load")
+    load_df = dedupe(load_df, list(spec_load.keys), spec_load.dedup_strategy,
+                     list(spec_load.measures))
+    n_load = write_silver(add_partitions(load_df, mapping),
+                          f"{fs}{layout.silver('grid_load')}", "grid_load")
 
+    # -- grid_generation ---------------------------------------------------
+    n_gen = 0
     if gens:
+        spec_gen = mapping.table("grid_generation")
         gen_df = reduce(DataFrame.unionByName, gens)
-        gen_df = add_partitions(dedupe(gen_df, ["ts_utc", "zone_id", "filiere"]))
-        write_silver(gen_df, f"{fs}{layout.silver('grid_generation')}",
-                     "grid_generation")
+        gen_df = dedupe(gen_df, list(spec_gen.keys), spec_gen.dedup_strategy)
+        n_gen = write_silver(add_partitions(gen_df, mapping),
+                             f"{fs}{layout.silver('grid_generation')}",
+                             "grid_generation")
+
+    # -- Quarantaine -------------------------------------------------------
+    if mapping.rejects.get("enabled", True) and rejects:
+        all_rejects = reduce(DataFrame.unionByName, rejects)
+        for table in ("grid_load", "grid_generation"):
+            part = all_rejects.filter(F.col("table_name") == table)
+            write_rejects(part, f"{fs}{layout.rejects(table)}", window,
+                          mapping.rejects.get("format", "parquet"))
+
+    summary = {"window": window, "grid_load": n_load,
+               "grid_generation": n_gen, "validation": reports}
+    log.info("Bilan : grid_load %d ligne(s), grid_generation %d ligne(s).",
+             n_load, n_gen)
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, ensure_ascii=False, indent=2)
+        log.info("Rapport de validation ecrit dans %s", args.report)
 
     spark.stop()
     return 0
