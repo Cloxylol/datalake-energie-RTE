@@ -364,18 +364,8 @@ docs/
 scripts/
   explore_schema.py           découverte des schémas réels
   test_idempotence.py         scénarios d'idempotence sans cluster
-  test_silver_local.py        31 contrôles Silver sans HDFS ni cluster
+  test_silver_local.py        33 contrôles Silver sans HDFS ni cluster
 ```
-
-## Reste à faire
-
-- [x] `conf/silver_mapping.yml` — mapping champs source → modèle commun
-- [x] `src/silver/` — validation de schéma, dédup, normalisation UTC, dépivotement des filières
-- [x] `src/gold/` — `mix_horaire`, `kpi_daily`, `ml_features`
-- [ ] `dags/` — DAGs Airflow avec dépendances par Datasets
-- [ ] `notebooks/` — restitution Pandas depuis Gold
-- [ ] `src/ml/` — prévision de consommation à H+24, benchmarkée contre la
-      prévision RTE présente dans le dataset
 
 ## Sources
 
