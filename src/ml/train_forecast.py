@@ -129,12 +129,17 @@ def main() -> int:
     if "lag_24h" in test.columns:
         results["baseline_persistance"] = metrics(y_te, test["lag_24h"].values)
 
-    # --- Baseline 2 : la prevision J-1 de RTE ----------------------------
-    if "rte_forecast_j1_mw" in test.columns:
-        mask = test["rte_forecast_j1_mw"].notna()
+    # --- Baseline 2 : la prevision J-1 de RTE ---------------------------
+    # Pour T+24 : rte_forecast_j1_h24_mw. La colonne rte_forecast_j1_mw
+    # (prevision pour T) donnerait une erreur decalee de 24 h.
+    bench_col = ("rte_forecast_j1_h24_mw"
+                 if "rte_forecast_j1_h24_mw" in test.columns
+                 else "rte_forecast_j1_mw")
+    if bench_col in test.columns:
+        mask = test[bench_col].notna()
         if mask.sum() > 10:
             results["benchmark_rte_j1"] = metrics(
-                y_te[mask.values], test.loc[mask, "rte_forecast_j1_mw"].values)
+                y_te[mask.values], test.loc[mask, bench_col].values)
 
     # --- Modeles ---------------------------------------------------------
     from sklearn.ensemble import GradientBoostingRegressor

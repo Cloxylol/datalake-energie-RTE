@@ -260,7 +260,9 @@ def build_ml_features(mix: DataFrame, holidays: list[str] | None = None) -> Data
 
     La prevision J-1 de RTE est conservee comme colonne de reference :
     c'est le benchmark contre lequel comparer le modele, et il est deja
-    dans les donnees.
+    dans les donnees. On la porte DEUX fois : pour l'heure courante T
+    (rte_forecast_j1_mw) et pour l'heure cible T+24 (rte_forecast_j1_h24_mw).
+    Seule la seconde se compare a target_consumption_h24 sans decalage.
     """
     w = Window.partitionBy("zone_id").orderBy(F.col("ts_utc").cast("long"))
     # Fenetre glissante en SECONDES, pas en lignes : les 24 dernieres heures
@@ -269,6 +271,11 @@ def build_ml_features(mix: DataFrame, holidays: list[str] | None = None) -> Data
 
     df = mix.withColumn("target_consumption_h24",
                         at_offset("consumption_mw", +FEATURES.lead, w))
+    # Prevision J-1 de RTE POUR l'horodatage cible (T+24). Prendre
+    # forecast_j1_mw de la ligne T opposerait la prevision de T au reel de
+    # T+24 : l'erreur du benchmark serait decalee de 24 h et gonflee.
+    df = df.withColumn("rte_forecast_j1_h24_mw",
+                       at_offset("forecast_j1_mw", +FEATURES.lead, w))
     for hours in FEATURES.lags:
         df = df.withColumn(f"lag_{hours}h",
                            at_offset("consumption_mw", -hours, w))
@@ -310,8 +317,10 @@ def build_ml_features(mix: DataFrame, holidays: list[str] | None = None) -> Data
                       "hour_sin", "hour_cos", "is_holiday",
                       "temperature_c", "hdd", "cdd", "wind_speed_ms",
                       "cloud_cover_pct",
-                      # Benchmark RTE : le modele doit se comparer a ca.
+                      # Benchmarks RTE : prevision J-1 pour T (erreur
+                      # "classique"), et pour T+24 (celle a comparer a la cible).
                       F.col("forecast_j1_mw").alias("rte_forecast_j1_mw"),
+                      "rte_forecast_j1_h24_mw",
                       "year", "month"))
 
 
