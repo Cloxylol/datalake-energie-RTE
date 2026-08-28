@@ -34,7 +34,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, "/opt/datalake/src")
+sys.path.insert(0, "/opt/datalake/src")               # dans le conteneur
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # depuis un checkout
 from common.config import Layout, load_config  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
